@@ -19,11 +19,31 @@ Needs Node 22.13 or newer (uses the built-in `node:sqlite`, so there is nothing 
 | Concern | How |
 |---|---|
 | Sign-in | Email and password (scrypt), HttpOnly SameSite=Lax session cookie, login throttling, sign-up throttling, origin check on every write |
+| Password reset and email verification | One-time links by email (see below). A reset signs the account out everywhere. With email on, AI analysis needs a confirmed address |
 | Tenancy | Every ticket, KB article, known issue, correction and audit row carries the org id, and every query filters on the org of the signed-in user. Tested: one org cannot read, overwrite or delete another's data |
 | Roles | `admin` (manages team), `agent` (edits, can use AI), `viewer` (read-only, cannot spend AI budget) |
 | Audit log | Append-only, enforced by database triggers. `who` and `when` are stamped by the server, not the client |
 | `/api/analyze` | Authenticates the org, clamps the model tier to the plan, applies redaction server-side, enforces the monthly token cap, per-minute rate limit and concurrency limit, records tokens per call |
 | Live team updates | Server-sent events, with polling as a fallback |
+
+## Email: password reset and verification
+
+Set four variables and restart. Resend is the one tested against; Postmark is wired the same way.
+
+```bash
+EMAIL_PROVIDER=resend
+RESEND_API_KEY=re_...
+EMAIL_FROM="Triage Desk <no-reply@yourdomain.com>"   # the domain must be verified in the Resend dashboard
+APP_URL=https://desk.yourdomain.com                   # links in emails are built from this
+```
+
+How it behaves:
+
+- **Verification.** Sign-up and "add teammate" send a confirmation link (24 hours, one use). Until it is used, the top bar shows a reminder with a resend button and AI analysis is refused; keyword rules keep working. Existing users count as unconfirmed after you turn email on and will see the same reminder.
+- **Reset.** "Forgot password?" on the sign-in dialog emails a link (1 hour, one use). Using it sets the new password, ends every session for that account, confirms the address and writes `password_reset` to the org audit log. A "your password was changed" email follows.
+- **Without a provider** (`EMAIL_PROVIDER` unset) nothing changes: no gating, and "Forgot password?" tells the user to ask their admin. `EMAIL_PROVIDER=log` prints emails to the console for local testing.
+- **Safety properties.** The forgot-password answer is identical for unknown and known addresses and does not wait for the provider. Tokens are 256-bit, stored only as SHA-256, and a newer link replaces an older one. Links use `APP_URL`, never the Host header, and carry the token in the `#fragment` so it stays out of server logs. Confirmation happens by POST, so mail scanners that pre-fetch links cannot use the token up. Limits: 3 reset emails per address per hour, 10 requests per IP per hour, 3 verification emails per user per hour.
+- **Other senders.** SES and SMTP are not included. A provider is one function in `mailer.js` returning `send({to, subject, text, html})`.
 
 ## Cost control (this is now yours)
 
@@ -44,7 +64,7 @@ node scripts/delete-org.js <org-id> --yes                # erase a customer's co
 ## Tests
 
 ```bash
-npm test                                   # 15 API tests against a mock AI (no real tokens spent)
+npm test                                   # 29 tests against a mock AI (no real tokens spent)
 python3 test/e2e/e2e.py                    # real-browser run (needs Playwright; start test/e2e/server.mjs first)
 ```
 
@@ -53,7 +73,7 @@ python3 test/e2e/e2e.py                    # real-browser run (needs Playwright;
 These matter before you take money or real customer data:
 
 1. **Billing.** No Stripe. Plans are changed with `set-plan.js` for now. The natural next step is a Stripe Checkout link plus a webhook that sets `orgs.plan`.
-2. **Email verification, password reset, SSO.** Sign-up accepts any email address, and a forgotten password currently needs you to reset it by hand. Set `SIGNUP_ENABLED=false` for invite-only until this exists.
+2. **SSO.** Not built. (Email verification and password reset are built: see the next section.)
 3. **Scaling past one process.** The rate limiters and the live-update streams are in memory, and the database is a single SQLite file. For several instances, move to Postgres (all SQL is in `db.js`) and Redis.
 4. **Backups and retention.** Back up `DB_PATH`. There is no automatic retention policy for tickets or the audit log.
 5. **Legal and compliance.** A DPA, subprocessor list and privacy policy. Redaction masks emails, phones, card and ID numbers, keys, passwords and IPs, but not names or free-text details, and it cannot mask text inside screenshots.

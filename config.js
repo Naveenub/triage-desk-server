@@ -43,6 +43,18 @@ export function loadConfig(env = process.env, overrides = {}) {
     trustProxy: env.TRUST_PROXY === 'true',
     allowedOrigins: (env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean),
     sessionDays: num('SESSION_DAYS', 14),
+    signupsPerHourPerIp: num('SIGNUPS_PER_HOUR_PER_IP', 5),
+    resetRequestsPerHourPerIp: num('RESET_REQUESTS_PER_HOUR_PER_IP', 10),
+    // Email (password reset and address verification). Leave EMAIL_PROVIDER unset to run without email.
+    emailProvider: env.EMAIL_PROVIDER || '',          // resend | postmark | log
+    emailFrom: env.EMAIL_FROM || '',                  // e.g. "Triage Desk <no-reply@yourdomain.com>" (domain must be verified with the provider)
+    appUrl: (env.APP_URL || '').replace(/\/$/, ''),    // public https URL, used for links in emails (never taken from the request)
+    resendApiKey: env.RESEND_API_KEY || '',
+    resendBaseUrl: (env.RESEND_BASE_URL || 'https://api.resend.com').replace(/\/$/, ''),
+    postmarkToken: env.POSTMARK_SERVER_TOKEN || '',
+    postmarkBaseUrl: (env.POSTMARK_BASE_URL || 'https://api.postmarkapp.com').replace(/\/$/, ''),
+    verifyTokenHours: num('VERIFY_TOKEN_HOURS', 24),
+    resetTokenMinutes: num('RESET_TOKEN_MINUTES', 60),
     // Per-collection limits so one tenant cannot fill the disk.
     docLimits: {
       tickets: { max: 5000, bytes: 64 * 1024 },

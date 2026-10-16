@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS users(
   pw_hash TEXT NOT NULL,
   role TEXT NOT NULL CHECK(role IN ('admin','agent','viewer')),
   disabled INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  email_verified_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS users_org ON users(org_id);
 CREATE TABLE IF NOT EXISTS sessions(
@@ -29,6 +30,15 @@ CREATE TABLE IF NOT EXISTS sessions(
   expires_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
+CREATE TABLE IF NOT EXISTS email_tokens(
+  token_hash TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  purpose TEXT NOT NULL CHECK(purpose IN ('verify','reset')),
+  email TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS email_tokens_user ON email_tokens(user_id, purpose);
 CREATE TABLE IF NOT EXISTS docs(
   org_id TEXT NOT NULL,
   coll TEXT NOT NULL,
@@ -72,6 +82,9 @@ export function openDb(path) {
   const db = new DatabaseSync(path);
   db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
   db.exec(SCHEMA);
+  // Databases created before email verification existed lack this column.
+  const cols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
+  if (!cols.includes('email_verified_at')) db.exec('ALTER TABLE users ADD COLUMN email_verified_at INTEGER');
   return db;
 }
 
@@ -108,6 +121,7 @@ export function makeStore(db) {
       q('INSERT INTO users(id,org_id,email,name,pw_hash,role,created_at) VALUES(?,?,?,?,?,?,?)')
         .run(id, orgId, email, name, pwHash, role, Date.now());
     },
+    userById: (id) => q('SELECT * FROM users WHERE id=?').get(id),
     userByEmail: (email) => q('SELECT * FROM users WHERE email=?').get(email),
     listTeam: (orgId) =>
       q('SELECT id,name,email,role FROM users WHERE org_id=? AND disabled=0 ORDER BY created_at').all(orgId),
@@ -126,7 +140,7 @@ export function makeStore(db) {
     createSession: (tokenHash, userId, expiresAt) =>
       q('INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)').run(tokenHash, userId, expiresAt),
     sessionByHash: (tokenHash) =>
-      q(`SELECT s.expires_at, u.id uid, u.email, u.name uname, u.role, u.disabled,
+      q(`SELECT s.expires_at, u.id uid, u.email, u.name uname, u.role, u.disabled, u.email_verified_at,
                 o.id oid, o.name oname, o.plan, o.ai_tokens_override, o.redact_server
            FROM sessions s JOIN users u ON u.id=s.user_id JOIN orgs o ON o.id=u.org_id
           WHERE s.token_hash=?`).get(tokenHash),
@@ -134,6 +148,40 @@ export function makeStore(db) {
       q('UPDATE sessions SET expires_at=? WHERE token_hash=?').run(expiresAt, tokenHash),
     deleteSession: (tokenHash) => q('DELETE FROM sessions WHERE token_hash=?').run(tokenHash),
     purgeSessions: () => q('DELETE FROM sessions WHERE expires_at<?').run(Date.now()),
+
+    // ---- email tokens (only the SHA-256 of a token is stored) ----
+    // Issuing a new token invalidates any earlier unused one of the same kind for that user.
+    createEmailToken({ hash, userId, purpose, email, expiresAt }) {
+      tx(db, () => {
+        q('DELETE FROM email_tokens WHERE user_id=? AND purpose=?').run(userId, purpose);
+        q('INSERT INTO email_tokens(token_hash,user_id,purpose,email,expires_at) VALUES(?,?,?,?,?)')
+          .run(hash, userId, purpose, email, expiresAt);
+      });
+    },
+    // Cheap pre-check so garbage tokens never reach the (expensive) password hash.
+    emailTokenValid: (hash, purpose) =>
+      Boolean(q('SELECT 1 x FROM email_tokens WHERE token_hash=? AND purpose=? AND used_at IS NULL AND expires_at>?')
+        .get(hash, purpose, Date.now())),
+    // Single use: the UPDATE only matches an unused, unexpired token, so two racing requests cannot both win.
+    // Returns the user, or null when the token is bad, used, expired, for a changed email, or the account is disabled.
+    useEmailToken(hash, purpose, apply) {
+      return tx(db, () => {
+        const t = q('UPDATE email_tokens SET used_at=? WHERE token_hash=? AND purpose=? AND used_at IS NULL AND expires_at>? RETURNING user_id,email')
+          .get(Date.now(), hash, purpose, Date.now());
+        if (!t) return null;
+        const u = q('SELECT * FROM users WHERE id=?').get(t.user_id);
+        if (!u || u.disabled || u.email !== t.email) return null;
+        apply(u);
+        return u;
+      });
+    },
+    markVerified: (id) =>
+      q('UPDATE users SET email_verified_at=COALESCE(email_verified_at,?) WHERE id=?').run(Date.now(), id),
+    setPassword(id, pwHash) {
+      q('UPDATE users SET pw_hash=? WHERE id=?').run(pwHash, id);
+      q('DELETE FROM sessions WHERE user_id=?').run(id); // a reset signs the account out everywhere
+    },
+    purgeEmailTokens: () => q('DELETE FROM email_tokens WHERE expires_at<?').run(Date.now() - 86400_000),
 
     // ---- documents (always scoped by org_id) ----
     listDocs: (orgId, coll, limit = 10000) =>

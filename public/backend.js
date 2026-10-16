@@ -182,6 +182,9 @@
     'dialog.td .err{color:var(--p1);font-size:14px;min-height:20px;margin-top:8px}',
     'dialog.td .acts{display:flex;gap:8px;justify-content:space-between;align-items:center;margin-top:12px;flex-wrap:wrap}',
     'dialog.td .link{background:none;border:0;padding:0;color:var(--accent);text-decoration:underline;font-weight:500}',
+    'dialog.td .ok{color:var(--accent);font-size:14px;min-height:20px;margin-top:8px}',
+    '#tdnote{background:var(--soft);border-bottom:1px solid var(--line);padding:6px 16px;font-size:13px;color:var(--ink)}',
+    '#tdbar .warn{color:var(--p2);font-weight:600}',
     'dialog.td table{width:100%;min-width:0;margin-top:8px}',
   ].join('');
   document.head.appendChild(css);
@@ -197,14 +200,16 @@
     return [el('label', { for: id, text: label }), input];
   }
 
-  function authDialog() {
+  function authDialog(initialNotice) {
     return new Promise((resolve) => {
       let mode = 'signin';
+      let notice = initialNotice || '';
       const dlg = el('dialog', { class: 'td', 'aria-labelledby': 'tda-h' });
       dlg.addEventListener('cancel', (e) => e.preventDefault()); // cannot be dismissed without signing in
       const form = el('form');
       const err = el('div', { class: 'err', role: 'alert' });
       const fields = el('div');
+      const forgot = el('button', { class: 'link', type: 'button', text: 'Forgot password?' });
       const title = el('h2', { id: 'tda-h' });
       const sub = el('p', { class: 'sub', style: 'margin:0 0 4px' });
       const submit = el('button', { class: 'primary', type: 'submit' });
@@ -217,34 +222,88 @@
           f.push(...field('tda-name', 'Your name', 'text', { autocomplete: 'name', maxlength: '80' }));
         }
         f.push(...field('tda-email', 'Work email', 'email', { autocomplete: 'email', maxlength: '255' }));
-        f.push(...field('tda-pw', mode === 'signup' ? 'Password (10 characters or more)' : 'Password', 'password',
+        if (mode !== 'forgot') f.push(...field('tda-pw', mode === 'signup' ? 'Password (10 characters or more)' : 'Password', 'password',
           { autocomplete: mode === 'signup' ? 'new-password' : 'current-password', minlength: mode === 'signup' ? '10' : '1', maxlength: '200' }));
         f.forEach((n) => fields.appendChild(n));
-        title.textContent = mode === 'signup' ? 'Create your workspace' : 'Sign in to Triage Desk';
-        sub.textContent = mode === 'signup' ? 'Your team shares one private queue, knowledge base and audit log.' : 'Your queue, knowledge base and audit log are private to your workspace.';
-        submit.textContent = mode === 'signup' ? 'Create workspace' : 'Sign in';
-        toggle.textContent = mode === 'signup' ? 'I already have an account' : 'Create a workspace';
-        err.textContent = '';
+        title.textContent = mode === 'signup' ? 'Create your workspace' : mode === 'forgot' ? 'Reset your password' : 'Sign in to Triage Desk';
+        sub.textContent = mode === 'signup' ? 'Your team shares one private queue, knowledge base and audit log.'
+          : mode === 'forgot' ? 'Enter your email and we will send you a link to choose a new password.'
+          : 'Your queue, knowledge base and audit log are private to your workspace.';
+        submit.textContent = mode === 'signup' ? 'Create workspace' : mode === 'forgot' ? 'Email me a link' : 'Sign in';
+        toggle.textContent = mode === 'signup' ? 'I already have an account' : mode === 'forgot' ? 'Back to sign in' : 'Create a workspace';
+        forgot.hidden = mode !== 'signin';
+        err.className = 'err'; err.textContent = notice; notice = '';
+        if (err.textContent) err.className = 'ok';
         const first = fields.querySelector('input');
         if (first) setTimeout(() => first.focus(), 0);
       }
-      toggle.onclick = () => { mode = mode === 'signup' ? 'signin' : 'signup'; draw(); };
+      toggle.onclick = () => { mode = mode === 'signin' ? 'signup' : 'signin'; draw(); };
+      forgot.onclick = () => { mode = 'forgot'; draw(); };
       form.onsubmit = async (e) => {
         e.preventDefault();
-        submit.disabled = true; err.textContent = '';
+        submit.disabled = true; err.className = 'err'; err.textContent = '';
         const v = (id) => (form.querySelector('#' + id) || {}).value || '';
         try {
+          if (mode === 'forgot') {
+            await api('/password/forgot', 'POST', { email: v('tda-email') });
+            err.className = 'ok'; err.textContent = 'If that address has an account, a reset link is on its way. It expires in one hour.';
+            submit.disabled = false; return;
+          }
           if (mode === 'signup') await api('/signup', 'POST', { orgName: v('tda-org'), name: v('tda-name'), email: v('tda-email'), password: v('tda-pw') });
           else await api('/login', 'POST', { email: v('tda-email'), password: v('tda-pw') });
           dlg.close(); dlg.remove(); resolve();
         } catch (x) { err.textContent = x.message; submit.disabled = false; }
       };
-      form.append(title, sub, fields, err, el('div', { class: 'acts' }, [toggle, submit]));
+      form.append(title, sub, fields, err, el('div', { class: 'acts' }, [toggle, forgot, submit]));
       dlg.appendChild(form);
       document.body.appendChild(dlg);
       draw();
       dlg.showModal();
     });
+  }
+
+  // Opened from the link in the reset email (#reset=TOKEN). Resolves once the password is changed.
+  function resetDialog(token) {
+    return new Promise((resolve) => {
+      const dlg = el('dialog', { class: 'td', 'aria-labelledby': 'tdr-h' });
+      dlg.addEventListener('cancel', (e) => e.preventDefault());
+      const form = el('form');
+      const err = el('div', { class: 'err', role: 'alert' });
+      const submit = el('button', { class: 'primary', type: 'submit', text: 'Change password' });
+      const back = el('button', { class: 'link', type: 'button', text: 'Back to sign in' });
+      back.onclick = () => { dlg.close(); dlg.remove(); resolve(false); };
+      form.onsubmit = async (e) => {
+        e.preventDefault();
+        const p1 = form.querySelector('#tdr-pw').value, p2 = form.querySelector('#tdr-pw2').value;
+        if (p1 !== p2) { err.textContent = 'The two passwords do not match'; return; }
+        submit.disabled = true; err.textContent = '';
+        try { await api('/password/reset', 'POST', { token, password: p1 }); dlg.close(); dlg.remove(); resolve(true); }
+        catch (x) { err.textContent = x.message; submit.disabled = false; }
+      };
+      const pw = { autocomplete: 'new-password', minlength: '10', maxlength: '200' };
+      form.append(el('h2', { id: 'tdr-h', text: 'Choose a new password' }),
+        ...field('tdr-pw', 'New password (10 characters or more)', 'password', pw),
+        ...field('tdr-pw2', 'Repeat the new password', 'password', pw),
+        err, el('div', { class: 'acts' }, [back, submit]));
+      dlg.appendChild(form);
+      document.body.appendChild(dlg);
+      dlg.showModal();
+      setTimeout(() => form.querySelector('#tdr-pw').focus(), 0);
+    });
+  }
+
+  // Links in emails carry a one-time token in the #fragment. Read it once and remove it from the address bar.
+  function takeHashToken() {
+    const m = /^#(reset|verify)=([A-Za-z0-9_-]{20,100})$/.exec(location.hash);
+    if (m) history.replaceState(null, '', location.pathname + location.search);
+    return m ? { kind: m[1], token: m[2] } : null;
+  }
+  // A link pasted into a tab that is already open only changes the hash: reload so boot sees it.
+  window.addEventListener('hashchange', () => { if (/^#(reset|verify)=/.test(location.hash)) location.reload(); });
+  function showNote(text) {
+    const n = el('div', { id: 'tdnote', role: 'status', text });
+    document.body.insertBefore(n, document.body.firstChild);
+    setTimeout(() => n.remove(), 12000);
   }
 
   let bar;
@@ -256,7 +315,16 @@
     const left = el('div', { class: 'grp' }, [el('b', { text: me.org.name }), document.createTextNode(me.user.name + ' (' + me.user.role + ')')]);
     const u = me.usage;
     const ai = el('div', { class: 'grp' });
-    if (!me.aiEnabled) {
+    if (me.email && me.email.enabled && !me.email.verified) {
+      ai.appendChild(el('span', { class: 'warn', text: 'Confirm your email (' + me.user.email + ') to turn on AI analysis.' }));
+      const rs = el('button', { class: 'chip', type: 'button', text: 'Resend link' });
+      rs.onclick = async () => {
+        rs.disabled = true;
+        try { await api('/email/send-verification', 'POST', {}); rs.textContent = 'Sent. Check your inbox'; }
+        catch (x) { rs.textContent = x.message; }
+      };
+      ai.appendChild(rs);
+    } else if (!me.aiEnabled) {
       ai.appendChild(document.createTextNode(u && u.cap <= 0 ? 'Plan: ' + u.plan + ' (keyword rules only, AI analysis not included)' : 'AI analysis is not available on this server'));
     } else {
       const pct = Math.min(100, Math.round((100 * u.used) / u.cap));
@@ -314,15 +382,31 @@
   }
 
   async function boot() {
+    const link = takeHashToken();
+    let note = '';
+    if (link && link.kind === 'reset') {
+      await new Promise((r) => (document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', r) : r()));
+      if (await resetDialog(link.token)) note = 'Password changed. Sign in with your new password.';
+    } else if (link && link.kind === 'verify') {
+      try { await api('/email/verify', 'POST', { token: link.token }); note = 'Email confirmed. Thank you.'; }
+      catch (x) { note = x.message; }
+    }
     try { me = await api('/me'); }
     catch (e) {
       if (e.code === 'network') { document.addEventListener('DOMContentLoaded', () => { document.body.insertBefore(el('div', { id: 'tdbar', text: 'Cannot reach the server. Reload to try again.' }), document.body.firstChild); }); return; }
       await new Promise((r) => (document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', r) : r()));
-      await authDialog();
+      await authDialog(link && link.kind === 'reset' ? note : '');
       me = await api('/me');
+      if (link && link.kind === 'reset') note = '';
     }
     await new Promise((r) => (document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', r) : r()));
     drawBar();
+    if (note) showNote(note);
+    // Confirmed the address in another tab? Pick that up when this tab is shown again.
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden || !(me.email && me.email.enabled && !me.email.verified)) return;
+      api('/me').then((m) => { if (m.email && m.email.verified) location.reload(); }).catch(() => {});
+    });
     startEvents();
     setInterval(() => { if (!document.hidden) api('/usage').then((u) => { me.usage = u; drawBar(); }).catch(() => {}); }, 60000);
     readyResolve();

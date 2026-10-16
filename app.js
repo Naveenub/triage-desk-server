@@ -8,6 +8,7 @@ import {
 import { callModel, extractJson, UpstreamError } from './anthropic.js';
 import { redact } from './redact.js';
 import { TIERS } from './config.js';
+import { createMailer, renderEmail } from './mailer.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -15,19 +16,24 @@ const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{2,}$/;
 const IMG_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 const COOKIE = 'td_sid';
 
-export function createApp({ config, db }) {
+export function createApp({ config, db, mailer = createMailer(config) }) {
   const store = makeStore(db);
   const app = express();
   app.disable('x-powered-by');
   if (config.trustProxy) app.set('trust proxy', 1);
 
   const loginLimiter = new Limiter(10, 15 * 60_000);   // failed logins per email+ip
-  const signupLimiter = new Limiter(5, 60 * 60_000);   // signups per ip
+  const signupLimiter = new Limiter(config.signupsPerHourPerIp, 60 * 60_000);   // signups per ip
+  const forgotIpLimiter = new Limiter(config.resetRequestsPerHourPerIp, 60 * 60_000);    // reset requests per ip
+  const forgotEmailLimiter = new Limiter(3, 60 * 60_000);  // reset emails per address (extra requests are silently dropped)
+  const resetLimiter = new Limiter(20, 15 * 60_000);       // reset/verify token attempts per ip
+  const verifySendLimiter = new Limiter(3, 60 * 60_000);   // verification emails per user
   const aiLimiter = new Limiter(60, 60_000);           // AI calls per org per minute (max comes from plan)
   const inflight = new Map();                          // orgId -> { n, tokens } reserved for running calls
   const streams = new Map();                           // orgId -> Set(res) for live updates
   const sweeper = setInterval(() => {
     loginLimiter.sweep(); signupLimiter.sweep(); aiLimiter.sweep(); store.purgeSessions();
+    forgotIpLimiter.sweep(); forgotEmailLimiter.sweep(); resetLimiter.sweep(); verifySendLimiter.sweep(); store.purgeEmailTokens();
   }, 10 * 60_000);
   sweeper.unref();
 
@@ -93,7 +99,7 @@ export function createApp({ config, db }) {
       setCookie(res, token);
     }
     req.tokenHash = h;
-    req.user = { id: s.uid, email: s.email, name: s.uname, role: s.role };
+    req.user = { id: s.uid, email: s.email, name: s.uname, role: s.role, emailVerified: Boolean(s.email_verified_at) };
     req.org = { id: s.oid, name: s.oname, plan: s.plan, ai_tokens_override: s.ai_tokens_override, redact_server: s.redact_server };
     next();
   }
@@ -122,6 +128,25 @@ export function createApp({ config, db }) {
     };
   }
   const aiEnabled = (org) => Boolean(config.apiKey) && capOf(org) > 0;
+  // With email configured, AI spend needs a confirmed address. Without email configured, nothing is gated.
+  const needsVerify = (user) => mailer.enabled && !user.emailVerified;
+
+  // ---------- email ----------
+  // Tokens are random, single use and stored only as a hash. Links use the configured APP_URL (never the Host
+  // header, which an attacker controls) and put the token in the #fragment so it stays out of server logs.
+  function sendTokenEmail(user, purpose) {
+    const token = newToken();
+    const ttl = purpose === 'verify' ? config.verifyTokenHours * 3600_000 : config.resetTokenMinutes * 60_000;
+    store.createEmailToken({ hash: hashToken(token), userId: user.id, purpose, email: user.email, expiresAt: Date.now() + ttl });
+    const msg = renderEmail(purpose, { name: user.name, link: `${config.appUrl}/#${purpose === 'verify' ? 'verify' : 'reset'}=${token}` });
+    return sendMail(user.email, msg);
+  }
+  // Fire and forget: the HTTP response never waits on the provider, so timing cannot reveal whether an address exists.
+  function sendMail(to, msg) {
+    return Promise.resolve()
+      .then(() => mailer.send({ to, ...msg }))
+      .catch((e) => console.error('email send failed:', e.message));
+  }
 
   // ---------- auth routes ----------
   const validPassword = (p) => typeof p === 'string' && p.length >= 10 && p.length <= 200;
@@ -142,6 +167,7 @@ export function createApp({ config, db }) {
       pwHash: await hashPassword(b.password), plan: config.defaultPlan,
     });
     startSession(res, userId);
+    if (mailer.enabled) sendTokenEmail({ id: userId, email, name }, 'verify');
     res.status(201).json({ ok: true });
   });
 
@@ -161,6 +187,56 @@ export function createApp({ config, db }) {
     res.json({ ok: true });
   });
 
+  // ---------- password reset and email verification ----------
+  const isToken = (t) => typeof t === 'string' && /^[A-Za-z0-9_-]{20,100}$/.test(t);
+
+  // Always answers the same way, whether or not the address has an account.
+  app.post('/api/password/forgot', small, (req, res) => {
+    if (!mailer.enabled) return fail(res, 503, 'email_disabled', 'Password reset by email is not set up on this server. Ask your workspace admin.');
+    if (!forgotIpLimiter.take(req.ip)) return fail(res, 429, 'rate_limited', 'Too many requests. Try again later.');
+    const email = clean((req.body || {}).email, 255).toLowerCase();
+    if (EMAIL_RE.test(email) && forgotEmailLimiter.take(email)) {
+      const u = store.userByEmail(email);
+      if (u && !u.disabled) sendTokenEmail(u, 'reset');
+    }
+    res.json({ ok: true });
+  });
+
+  app.post('/api/password/reset', small, async (req, res) => {
+    if (!resetLimiter.take(req.ip)) return fail(res, 429, 'rate_limited', 'Too many attempts. Try again later.');
+    const b = req.body || {};
+    if (!isToken(b.token) || !store.emailTokenValid(hashToken(b.token), 'reset')) {
+      return fail(res, 400, 'bad_token', 'This reset link is invalid or has expired. Request a new one.');
+    }
+    if (!validPassword(b.password)) return fail(res, 400, 'weak_password', 'Use a password of at least 10 characters');
+    const pwHash = await hashPassword(b.password);
+    const u = store.useEmailToken(hashToken(b.token), 'reset', (user) => {
+      store.setPassword(user.id, pwHash);
+      store.markVerified(user.id); // they received mail at this address, which proves they own it
+      store.addAudit(user.org_id, { by: user.id, act: 'password_reset' });
+    });
+    if (!u) return fail(res, 400, 'bad_token', 'This reset link is invalid or has expired. Request a new one.');
+    sendMail(u.email, renderEmail('password_changed', { name: u.name }));
+    res.json({ ok: true });
+  });
+
+  // POST rather than GET, so mail scanners that pre-fetch links cannot use up the token.
+  app.post('/api/email/verify', small, (req, res) => {
+    if (!resetLimiter.take(req.ip)) return fail(res, 429, 'rate_limited', 'Too many attempts. Try again later.');
+    const b = req.body || {};
+    const u = isToken(b.token) && store.useEmailToken(hashToken(b.token), 'verify', (user) => store.markVerified(user.id));
+    if (!u) return fail(res, 400, 'bad_token', 'This confirmation link is invalid or has expired. Sign in and ask for a new one.');
+    res.json({ ok: true });
+  });
+
+  app.post('/api/email/send-verification', requireAuth, (req, res) => {
+    if (!mailer.enabled) return fail(res, 503, 'email_disabled', 'Email is not set up on this server');
+    if (req.user.emailVerified) return res.json({ ok: true, alreadyVerified: true });
+    if (!verifySendLimiter.take(req.user.id)) return fail(res, 429, 'rate_limited', 'Too many emails requested. Try again in an hour.');
+    sendTokenEmail(req.user, 'verify');
+    res.json({ ok: true });
+  });
+
   app.post('/api/logout', requireAuth, (req, res) => {
     store.deleteSession(req.tokenHash);
     clearCookie(res);
@@ -172,7 +248,8 @@ export function createApp({ config, db }) {
     res.json({
       user: req.user,
       org: { id: req.org.id, name: req.org.name, plan: req.org.plan },
-      aiEnabled: aiEnabled(req.org),
+      aiEnabled: aiEnabled(req.org) && !needsVerify(req.user),
+      email: { enabled: mailer.enabled, verified: req.user.emailVerified },
       limits: { maxImages: plan.maxImages },
       usage: usageSummary(req.org),
     });
@@ -193,6 +270,7 @@ export function createApp({ config, db }) {
     if (store.userByEmail(email)) return fail(res, 409, 'email_taken', 'That email already has an account');
     const id = newId('u_');
     store.createUser({ id, orgId: req.org.id, email, name, role, pwHash: await hashPassword(b.password) });
+    if (mailer.enabled) sendTokenEmail({ id, email, name }, 'verify');
     store.addAudit(req.org.id, { by: req.user.id, act: 'user_added', d: `${role}` });
     res.status(201).json({ id, email, name, role });
   });
@@ -328,6 +406,7 @@ export function createApp({ config, db }) {
     if (typeof b.prompt !== 'string' || !b.prompt.trim()) return fail(res, 400, 'bad_request', 'A prompt is required');
     if (b.prompt.length > config.maxPromptChars) return fail(res, 413, 'too_large', 'That ticket is too long to analyze');
     if (!config.apiKey) return fail(res, 503, 'not_granted', 'AI analysis is not configured on this server');
+    if (needsVerify(user)) return fail(res, 403, 'not_granted', 'Confirm your email address to use AI analysis. Check your inbox for the link.');
     const cap = capOf(org);
     if (cap <= 0) return fail(res, 403, 'not_granted', 'AI analysis is not included in your plan');
 
