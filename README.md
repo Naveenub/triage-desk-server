@@ -45,6 +45,21 @@ How it behaves:
 - **Safety properties.** The forgot-password answer is identical for unknown and known addresses and does not wait for the provider. Tokens are 256-bit, stored only as SHA-256, and a newer link replaces an older one. Links use `APP_URL`, never the Host header, and carry the token in the `#fragment` so it stays out of server logs. Confirmation happens by POST, so mail scanners that pre-fetch links cannot use the token up. Limits: 3 reset emails per address per hour, 10 requests per IP per hour, 3 verification emails per user per hour.
 - **Other senders.** SES and SMTP are not included. A provider is one function in `mailer.js` returning `send({to, subject, text, html})`.
 
+## Backups (SQLite)
+
+Everything lives in one file (`DB_PATH`), so a backup is a consistent copy of it. `VACUUM INTO` takes that copy while the server is running, without stopping writes, and each snapshot is opened and integrity-checked before it counts. Do not just `cp` the `.db` file of a running server: in WAL mode that can miss recent writes.
+
+```bash
+node scripts/backup.js                 # writes ./backups/triage-YYYYMMDD-HHMMSS.db, keeps the newest 14
+node scripts/backup.js /mnt/backups 30 # custom folder and number to keep
+```
+
+Run it on a schedule, either from cron (`0 */6 * * * cd /app && node --env-file=.env scripts/backup.js`) or inside the server with `BACKUP_EVERY_HOURS=24`. Backups hold password hashes and customer data, so files are created `0600` in a `0700` folder.
+
+**A backup on the same disk does not survive losing the disk.** Copy the folder somewhere else on a schedule, for example `aws s3 sync /app/backups s3://your-bucket/triage/` or `rclone sync /app/backups remote:triage`, and turn on versioning or retention at the destination.
+
+Restore: stop the server, copy the chosen snapshot over `DB_PATH` (and delete any `DB_PATH-wal` and `DB_PATH-shm` files next to it), start the server. Try a restore once on a spare machine before you need it. Anything written after the snapshot is lost, which is why the interval matters: `BACKUP_EVERY_HOURS=6` means at most six hours.
+
 ## Billing (Stripe)
 
 Stripe Checkout for sign-up, a webhook that sets the plan, and the Stripe customer portal for card changes, invoices and cancellation. Prices live in Stripe, so changing a price never needs a deploy.
@@ -83,7 +98,7 @@ node scripts/delete-org.js <org-id> --yes                # erase a customer's co
 ## Tests
 
 ```bash
-npm test                                   # 40 tests against a mock AI (no real tokens spent)
+npm test                                   # 43 tests against a mock AI (no real tokens spent)
 python3 test/e2e/e2e.py                    # real-browser run (needs Playwright; start test/e2e/server.mjs first)
 ```
 
@@ -94,7 +109,7 @@ These matter before you take money or real customer data:
 1. **Tax, invoices and refunds policy.** Stripe billing is built (next section) but VAT/GST collection (Stripe Tax), invoice branding and your refund and cancellation terms are yours to set up in the Stripe dashboard.
 2. **SSO.** Not built. (Email verification and password reset are built: see the next section.)
 3. **Scaling past one process.** The rate limiters and the live-update streams are in memory, and the database is a single SQLite file. For several instances, move to Postgres (all SQL is in `db.js`) and Redis.
-4. **Backups and retention.** Back up `DB_PATH`. There is no automatic retention policy for tickets or the audit log.
+4. **Retention and off-site copies.** Backups exist (next section) but there is no retention policy for tickets or the audit log, and nothing copies backups off the machine for you.
 5. **Legal and compliance.** A DPA, subprocessor list and privacy policy. Redaction masks emails, phones, card and ID numbers, keys, passwords and IPs, but not names or free-text details, and it cannot mask text inside screenshots.
 6. **A security review of the page itself.** The page builds a lot of HTML from ticket text. It escapes it, but with multiple customers' data on one server it deserves a dedicated XSS pass.
 

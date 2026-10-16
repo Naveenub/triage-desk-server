@@ -59,6 +59,9 @@ export function loadConfig(env = process.env, overrides = {}) {
     stripePrices: json('STRIPE_PRICES_JSON', env.STRIPE_PRICE_TEAM ? { team: env.STRIPE_PRICE_TEAM } : {}),
     stripeBaseUrl: (env.STRIPE_BASE_URL || 'https://api.stripe.com').replace(/\/$/, ''),
     billingDowngradePlan: env.BILLING_DOWNGRADE_PLAN || 'free', // plan an org falls back to when its subscription ends
+    backupDir: env.BACKUP_DIR || './backups',
+    backupKeep: num('BACKUP_KEEP', 14),                 // newest N snapshots are kept
+    backupEveryHours: num('BACKUP_EVERY_HOURS', 0),     // 0 = no built-in schedule (use cron and scripts/backup.js instead)
     verifyTokenHours: num('VERIFY_TOKEN_HOURS', 24),
     resetTokenMinutes: num('RESET_TOKEN_MINUTES', 60),
     // Per-collection limits so one tenant cannot fill the disk.

@@ -3,6 +3,7 @@ import { openDb } from './db.js';
 import { createApp } from './app.js';
 import { createMailer } from './mailer.js';
 import { createStripe } from './stripe.js';
+import { backupNow } from './backup.js';
 
 const config = loadConfig();
 const db = openDb(config.dbPath);
@@ -24,6 +25,19 @@ if (config.emailProvider === 'log') console.warn('EMAIL_PROVIDER=log prints emai
 if (!config.apiKey) console.warn('ANTHROPIC_API_KEY is not set: AI analysis is off, keyword rules still work.');
 if (process.env.NODE_ENV === 'production' && !config.cookieSecure) {
   console.warn('COOKIE_SECURE is false in production. Serve over HTTPS and set COOKIE_SECURE=true.');
+}
+
+let backupTimer;
+if (config.backupEveryHours > 0) {
+  const run = () => {
+    try { const r = backupNow({ dbPath: config.dbPath, dir: config.backupDir, keep: config.backupKeep }); console.log(`backup ok: ${r.file}`); }
+    catch (e) { console.error('BACKUP FAILED:', e.message); }
+  };
+  setTimeout(run, 30_000).unref();                                   // one shortly after start, then on the interval
+  backupTimer = setInterval(run, config.backupEveryHours * 3600_000);
+  backupTimer.unref();
+} else {
+  console.warn('Scheduled backups are off (BACKUP_EVERY_HOURS=0). Run scripts/backup.js from cron, or set BACKUP_EVERY_HOURS.');
 }
 
 const server = app.listen(config.port, () => {
