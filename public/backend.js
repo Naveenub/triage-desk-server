@@ -295,11 +295,56 @@
   // Links in emails carry a one-time token in the #fragment. Read it once and remove it from the address bar.
   function takeHashToken() {
     const m = /^#(reset|verify)=([A-Za-z0-9_-]{20,100})$/.exec(location.hash);
-    if (m) history.replaceState(null, '', location.pathname + location.search);
+    const bm = /^#billing=(success|cancel)$/.exec(location.hash);
+    if (m || bm) history.replaceState(null, '', location.pathname + location.search);
+    if (bm) return { kind: 'billing', token: bm[1] };
     return m ? { kind: m[1], token: m[2] } : null;
   }
   // A link pasted into a tab that is already open only changes the hash: reload so boot sees it.
-  window.addEventListener('hashchange', () => { if (/^#(reset|verify)=/.test(location.hash)) location.reload(); });
+  window.addEventListener('hashchange', () => { if (/^#(reset|verify)=|^#billing=/.test(location.hash)) location.reload(); });
+  // Billing dialog (admins). Checkout and the customer portal are Stripe-hosted pages: we only fetch a link and go there.
+  async function billingDialog() {
+    const b = me.billing;
+    const dlg = el('dialog', { class: 'td', 'aria-labelledby': 'tdb-h' });
+    const form = el('form', { method: 'dialog' });
+    const err = el('div', { class: 'err', role: 'alert' });
+    const go = async (path, body, btn) => {
+      err.textContent = ''; btn.disabled = true;
+      try { const r = await api(path, 'POST', body); location.href = r.url; }
+      catch (x) { err.textContent = x.message; btn.disabled = false; }
+    };
+    const statusLine = b.subscribed
+      ? 'Subscription active' + (b.status === 'past_due' ? ' (last payment failed: update your card)' : '') + (b.periodEnd ? '. Renews or ends ' + new Date(b.periodEnd).toLocaleDateString() : '') + '.'
+      : 'No active subscription.';
+    const kids = [el('h2', { id: 'tdb-h', text: 'Billing' }), el('p', { class: 'sub', text: 'Current plan: ' + me.org.plan + '. ' + statusLine })];
+    if (!b.subscribed) {
+      b.plans.forEach((p) => {
+        const btn = el('button', { class: 'primary', type: 'button', text: 'Subscribe to ' + p });
+        btn.onclick = () => go('/billing/checkout', { plan: p }, btn);
+        kids.push(el('div', { style: 'margin-top:10px' }, [btn]));
+      });
+    }
+    if (b.canManage) {
+      const btn = el('button', { class: 'chip', type: 'button', text: 'Manage billing (card, invoices, cancel)' });
+      btn.onclick = () => go('/billing/portal', undefined, btn);
+      kids.push(el('div', { style: 'margin-top:10px' }, [btn]));
+    }
+    kids.push(err, el('div', { class: 'acts' }, [el('button', { type: 'submit', formnovalidate: '', text: 'Close' })]));
+    form.append(...kids);
+    dlg.appendChild(form);
+    dlg.addEventListener('close', () => dlg.remove());
+    document.body.appendChild(dlg);
+    dlg.showModal();
+  }
+
+  // After paying, the plan changes when Stripe's webhook arrives (usually seconds). Check a few times, then reload.
+  function waitForPlanChange(startPlan, tries) {
+    api('/me').then((m) => {
+      if (m.org.plan !== startPlan) { location.reload(); return; }
+      if (tries > 0) setTimeout(() => waitForPlanChange(startPlan, tries - 1), 2500);
+      else showNote('Payment received. Your plan will update shortly: reload this page in a minute.');
+    }).catch(() => {});
+  }
   function showNote(text) {
     const n = el('div', { id: 'tdnote', role: 'status', text });
     document.body.insertBefore(n, document.body.firstChild);
@@ -333,6 +378,7 @@
       if (pct >= 100) ai.appendChild(el('b', { text: 'Limit reached: keyword rules still work' }));
     }
     const right = el('div', { class: 'grp' });
+    if (me.user.role === 'admin' && me.billing && me.billing.enabled) { const bb = el('button', { class: 'chip', type: 'button', text: 'Billing' }); bb.onclick = billingDialog; right.appendChild(bb); }
     if (me.user.role === 'admin') { const b = el('button', { class: 'chip', type: 'button', text: 'Team' }); b.onclick = teamDialog; right.appendChild(b); }
     const out = el('button', { class: 'chip', type: 'button', text: 'Sign out' });
     out.onclick = async () => { try { await api('/logout', 'POST', {}); } catch (e) { /* ignore */ } location.reload(); };
@@ -402,6 +448,10 @@
     await new Promise((r) => (document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', r) : r()));
     drawBar();
     if (note) showNote(note);
+    if (link && link.kind === 'billing') {
+      if (link.token === 'success') { showNote('Payment received. Updating your plan…'); waitForPlanChange(me.org.plan, 8); }
+      else showNote('Checkout cancelled. You were not charged.');
+    }
     // Confirmed the address in another tab? Pick that up when this tab is shown again.
     document.addEventListener('visibilitychange', () => {
       if (document.hidden || !(me.email && me.email.enabled && !me.email.verified)) return;

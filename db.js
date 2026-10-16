@@ -12,6 +12,10 @@ CREATE TABLE IF NOT EXISTS orgs(
   redact_server INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS stripe_events(
+  id TEXT PRIMARY KEY,
+  at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS users(
   id TEXT PRIMARY KEY,
   org_id TEXT NOT NULL REFERENCES orgs(id),
@@ -84,6 +88,11 @@ export function openDb(path) {
   db.exec(SCHEMA);
   // Databases created before email verification existed lack this column.
   const cols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
+  const orgCols = db.prepare('PRAGMA table_info(orgs)').all().map((c) => c.name);
+  for (const [name, type] of [['stripe_customer_id', 'TEXT'], ['stripe_subscription_id', 'TEXT'], ['stripe_status', 'TEXT'],
+    ['stripe_period_end', 'INTEGER'], ['stripe_event_at', 'INTEGER']]) {
+    if (!orgCols.includes(name)) db.exec(`ALTER TABLE orgs ADD COLUMN ${name} ${type}`);
+  }
   if (!cols.includes('email_verified_at')) db.exec('ALTER TABLE users ADD COLUMN email_verified_at INTEGER');
   return db;
 }
@@ -135,6 +144,26 @@ export function makeStore(db) {
       });
     },
     orgById: (id) => q('SELECT * FROM orgs WHERE id=?').get(id),
+    orgByStripeCustomer: (id) => q('SELECT * FROM orgs WHERE stripe_customer_id=?').get(id),
+
+    // ---- billing ----
+    // Runs fn once per Stripe event id. The id is recorded in the same transaction as fn's writes, so a crash
+    // mid-way rolls both back and Stripe's retry is processed normally. Returns false for a duplicate delivery.
+    processStripeEvent(eventId, fn) {
+      return tx(db, () => {
+        if (q('INSERT OR IGNORE INTO stripe_events(id,at) VALUES(?,?)').run(eventId, Date.now()).changes === 0) return false;
+        fn();
+        return true;
+      });
+    },
+    updateOrgBilling: (id, b) =>
+      q(`UPDATE orgs SET plan=COALESCE(?,plan), stripe_customer_id=COALESCE(?,stripe_customer_id),
+           stripe_subscription_id=?, stripe_status=?, stripe_period_end=?, stripe_event_at=? WHERE id=?`)
+        .run(b.plan ?? null, b.customerId ?? null, b.subscriptionId ?? null, b.status ?? null, b.periodEnd ?? null, b.eventAt ?? null, id),
+    linkOrgStripe: (id, customerId, subscriptionId) =>
+      q('UPDATE orgs SET stripe_customer_id=COALESCE(stripe_customer_id,?), stripe_subscription_id=COALESCE(stripe_subscription_id,?) WHERE id=?')
+        .run(customerId || null, subscriptionId || null, id),
+    purgeStripeEvents: () => q('DELETE FROM stripe_events WHERE at<?').run(Date.now() - 30 * 86400_000),
 
     // ---- sessions ----
     createSession: (tokenHash, userId, expiresAt) =>

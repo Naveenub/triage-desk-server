@@ -45,6 +45,25 @@ How it behaves:
 - **Safety properties.** The forgot-password answer is identical for unknown and known addresses and does not wait for the provider. Tokens are 256-bit, stored only as SHA-256, and a newer link replaces an older one. Links use `APP_URL`, never the Host header, and carry the token in the `#fragment` so it stays out of server logs. Confirmation happens by POST, so mail scanners that pre-fetch links cannot use the token up. Limits: 3 reset emails per address per hour, 10 requests per IP per hour, 3 verification emails per user per hour.
 - **Other senders.** SES and SMTP are not included. A provider is one function in `mailer.js` returning `send({to, subject, text, html})`.
 
+## Billing (Stripe)
+
+Stripe Checkout for sign-up, a webhook that sets the plan, and the Stripe customer portal for card changes, invoices and cancellation. Prices live in Stripe, so changing a price never needs a deploy.
+
+Setup, in the Stripe dashboard:
+1. Create a recurring **Price** for each paid plan and copy its `price_...` id.
+2. Turn on the **Customer portal** (Settings, Billing, Customer portal) and choose what customers may do there.
+3. Add a **webhook endpoint** `https://YOUR-APP-URL/api/stripe/webhook` with the events `checkout.session.completed` and `customer.subscription.created`, `.updated`, `.deleted`. Copy its signing secret.
+4. Set `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_TEAM` (or `STRIPE_PRICES_JSON` for several plans) and `APP_URL`. The server refuses to start if only some are set, or if a price names a plan that is not in `config.js`.
+5. Test with `sk_test_` keys and Stripe's test cards before going live; `stripe listen --forward-to localhost:3000/api/stripe/webhook` forwards events to your machine.
+
+How it behaves:
+- An admin sees a **Billing** button. It starts Checkout for a plan, or opens the portal once the workspace has a Stripe customer. Checkout and the portal are Stripe's pages.
+- **Only a signed webhook changes the plan.** Returning from Checkout does not, so nobody can reach a paid plan by visiting the success URL. The page re-checks for a few seconds after payment and then reloads.
+- `active`, `trialing` and `past_due` keep the paid plan (while Stripe retries a failed card the customer keeps access and sees a notice). `canceled`, `unpaid` and `incomplete_expired` move the org to `BILLING_DOWNGRADE_PLAN` (default `free`: keyword rules only; their data stays).
+- Webhooks are verified (HMAC, 5-minute tolerance), processed once per event id in the same transaction as the change, and a failure returns 500 so Stripe retries. An older event arriving after a newer one is ignored, and so is the end of a previous subscription.
+- Plan changes are written to the org audit log as `plan_changed`. A workspace that already has a subscription cannot open a second Checkout.
+- A plan set by hand with `set-plan.js` is overwritten by the next Stripe event for that org. Use it only for orgs that do not pay through Stripe. Per-org token overrides are left alone.
+
 ## Cost control (this is now yours)
 
 - Plans live in `config.js` (`free`, `trial`, `team`) and can be overridden with `PLANS_JSON`. Each has a monthly token allowance, a highest model tier, a screenshot limit and a requests-per-minute limit.
@@ -64,7 +83,7 @@ node scripts/delete-org.js <org-id> --yes                # erase a customer's co
 ## Tests
 
 ```bash
-npm test                                   # 29 tests against a mock AI (no real tokens spent)
+npm test                                   # 40 tests against a mock AI (no real tokens spent)
 python3 test/e2e/e2e.py                    # real-browser run (needs Playwright; start test/e2e/server.mjs first)
 ```
 
@@ -72,7 +91,7 @@ python3 test/e2e/e2e.py                    # real-browser run (needs Playwright;
 
 These matter before you take money or real customer data:
 
-1. **Billing.** No Stripe. Plans are changed with `set-plan.js` for now. The natural next step is a Stripe Checkout link plus a webhook that sets `orgs.plan`.
+1. **Tax, invoices and refunds policy.** Stripe billing is built (next section) but VAT/GST collection (Stripe Tax), invoice branding and your refund and cancellation terms are yours to set up in the Stripe dashboard.
 2. **SSO.** Not built. (Email verification and password reset are built: see the next section.)
 3. **Scaling past one process.** The rate limiters and the live-update streams are in memory, and the database is a single SQLite file. For several instances, move to Postgres (all SQL is in `db.js`) and Redis.
 4. **Backups and retention.** Back up `DB_PATH`. There is no automatic retention policy for tickets or the audit log.

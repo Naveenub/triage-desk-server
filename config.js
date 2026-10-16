@@ -53,6 +53,12 @@ export function loadConfig(env = process.env, overrides = {}) {
     resendBaseUrl: (env.RESEND_BASE_URL || 'https://api.resend.com').replace(/\/$/, ''),
     postmarkToken: env.POSTMARK_SERVER_TOKEN || '',
     postmarkBaseUrl: (env.POSTMARK_BASE_URL || 'https://api.postmarkapp.com').replace(/\/$/, ''),
+    // Stripe billing. Prices live in Stripe; we only need their ids. STRIPE_PRICES_JSON={"team":"price_..."} maps plan name -> price id.
+    stripeSecretKey: env.STRIPE_SECRET_KEY || '',
+    stripeWebhookSecret: env.STRIPE_WEBHOOK_SECRET || '',
+    stripePrices: json('STRIPE_PRICES_JSON', env.STRIPE_PRICE_TEAM ? { team: env.STRIPE_PRICE_TEAM } : {}),
+    stripeBaseUrl: (env.STRIPE_BASE_URL || 'https://api.stripe.com').replace(/\/$/, ''),
+    billingDowngradePlan: env.BILLING_DOWNGRADE_PLAN || 'free', // plan an org falls back to when its subscription ends
     verifyTokenHours: num('VERIFY_TOKEN_HOURS', 24),
     resetTokenMinutes: num('RESET_TOKEN_MINUTES', 60),
     // Per-collection limits so one tenant cannot fill the disk.

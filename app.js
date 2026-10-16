@@ -9,6 +9,7 @@ import { callModel, extractJson, UpstreamError } from './anthropic.js';
 import { redact } from './redact.js';
 import { TIERS } from './config.js';
 import { createMailer, renderEmail } from './mailer.js';
+import { createStripe, verifyWebhook } from './stripe.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -16,7 +17,7 @@ const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{2,}$/;
 const IMG_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 const COOKIE = 'td_sid';
 
-export function createApp({ config, db, mailer = createMailer(config) }) {
+export function createApp({ config, db, mailer = createMailer(config), stripe = createStripe(config) }) {
   const store = makeStore(db);
   const app = express();
   app.disable('x-powered-by');
@@ -33,7 +34,7 @@ export function createApp({ config, db, mailer = createMailer(config) }) {
   const streams = new Map();                           // orgId -> Set(res) for live updates
   const sweeper = setInterval(() => {
     loginLimiter.sweep(); signupLimiter.sweep(); aiLimiter.sweep(); store.purgeSessions();
-    forgotIpLimiter.sweep(); forgotEmailLimiter.sweep(); resetLimiter.sweep(); verifySendLimiter.sweep(); store.purgeEmailTokens();
+    forgotIpLimiter.sweep(); forgotEmailLimiter.sweep(); resetLimiter.sweep(); verifySendLimiter.sweep(); store.purgeEmailTokens(); store.purgeStripeEvents();
   }, 10 * 60_000);
   sweeper.unref();
 
@@ -130,6 +131,110 @@ export function createApp({ config, db, mailer = createMailer(config) }) {
   const aiEnabled = (org) => Boolean(config.apiKey) && capOf(org) > 0;
   // With email configured, AI spend needs a confirmed address. Without email configured, nothing is gated.
   const needsVerify = (user) => mailer.enabled && !user.emailVerified;
+
+  // ---------- billing ----------
+  const ACTIVE = new Set(['active', 'trialing', 'past_due']);   // paid access continues (past_due: Stripe is still retrying the card)
+  const ENDED = new Set(['canceled', 'unpaid', 'incomplete_expired']);
+  function billingSummary(req) {
+    if (!stripe.enabled) return { enabled: false };
+    const o = store.orgById(req.org.id);
+    return {
+      enabled: true,
+      plans: Object.keys(config.stripePrices),
+      status: o.stripe_status || null,
+      subscribed: ACTIVE.has(o.stripe_status || ''),
+      canManage: Boolean(o.stripe_customer_id),
+      periodEnd: o.stripe_period_end || null,
+    };
+  }
+
+  // Admin starts a subscription. The org id travels with the Stripe objects as metadata, which is how the
+  // webhook finds the org again. The plan is NOT changed here: only a signed webhook from Stripe changes plans.
+  app.post('/api/billing/checkout', requireAuth, requireAdmin, small, async (req, res) => {
+    if (!stripe.enabled) return fail(res, 503, 'billing_disabled', 'Billing is not set up on this server');
+    const plan = (req.body || {}).plan;
+    if (typeof plan !== 'string' || !Object.hasOwn(config.stripePrices, plan)) return fail(res, 400, 'bad_request', 'Unknown plan');
+    const org = store.orgById(req.org.id);
+    if (ACTIVE.has(org.stripe_status || '')) return fail(res, 409, 'already_subscribed', 'This workspace already has a subscription. Use Manage billing to change it.');
+    try {
+      const session = await stripe.createCheckout({
+        mode: 'subscription',
+        line_items: [{ price: config.stripePrices[plan], quantity: 1 }],
+        client_reference_id: org.id,
+        ...(org.stripe_customer_id ? { customer: org.stripe_customer_id } : { customer_email: req.user.email }),
+        metadata: { org_id: org.id },
+        subscription_data: { metadata: { org_id: org.id } },
+        success_url: `${config.appUrl}/#billing=success`,
+        cancel_url: `${config.appUrl}/#billing=cancel`,
+      });
+      res.json({ url: session.url });
+    } catch (e) {
+      console.error(e.message);
+      fail(res, 502, 'upstream_error', 'Could not reach the payment provider. Try again.');
+    }
+  });
+
+  // Stripe-hosted page to change plan, update the card, see invoices or cancel.
+  app.post('/api/billing/portal', requireAuth, requireAdmin, async (req, res) => {
+    if (!stripe.enabled) return fail(res, 503, 'billing_disabled', 'Billing is not set up on this server');
+    const org = store.orgById(req.org.id);
+    if (!org.stripe_customer_id) return fail(res, 400, 'no_customer', 'This workspace has no billing account yet');
+    try {
+      const s = await stripe.createPortal({ customer: org.stripe_customer_id, return_url: `${config.appUrl}/` });
+      res.json({ url: s.url });
+    } catch (e) {
+      console.error(e.message);
+      fail(res, 502, 'upstream_error', 'Could not open the billing portal. Try again.');
+    }
+  });
+
+  function applySubscription(sub, eventAt) {
+    const org = (sub.metadata && sub.metadata.org_id && store.orgById(sub.metadata.org_id)) || store.orgByStripeCustomer(sub.customer);
+    if (!org) { console.error('stripe: subscription for unknown org', sub.id); return; }
+    if (org.stripe_event_at && eventAt < org.stripe_event_at) return; // an older event arriving late must not undo a newer one
+    const active = ACTIVE.has(sub.status), ended = ENDED.has(sub.status);
+    // The end of some OTHER (older) subscription must not cancel the one the org is on now.
+    if (ended && org.stripe_subscription_id && org.stripe_subscription_id !== sub.id) return;
+    const item = sub.items && sub.items.data && sub.items.data[0];
+    const periodEnd = (sub.current_period_end ?? (item && item.current_period_end) ?? null);
+    const base = { customerId: sub.customer, subscriptionId: sub.id, status: sub.status, periodEnd: periodEnd ? periodEnd * 1000 : null, eventAt };
+    if (active) {
+      const plan = stripe.priceToPlan[item && item.price && item.price.id];
+      if (!plan) { console.error('stripe: subscription', sub.id, 'has a price that is not in STRIPE_PRICES_JSON; plan left unchanged'); return; }
+      store.updateOrgBilling(org.id, { ...base, plan });
+      if (plan !== org.plan) store.addAudit(org.id, { by: 'stripe', act: 'plan_changed', d: `${org.plan} to ${plan}` });
+    } else if (ended) {
+      store.updateOrgBilling(org.id, { ...base, subscriptionId: null, plan: config.billingDowngradePlan });
+      store.addAudit(org.id, { by: 'stripe', act: 'plan_changed', d: `${org.plan} to ${config.billingDowngradePlan}` });
+    } else if (!org.stripe_subscription_id || org.stripe_subscription_id === sub.id) {
+      // e.g. incomplete: record the status only, and never let a not-yet-paid subscription hide a working one
+      store.updateOrgBilling(org.id, { ...base, subscriptionId: org.stripe_subscription_id, periodEnd: org.stripe_period_end });
+    }
+  }
+
+  // Needs the exact bytes Stripe signed, so it reads the body raw instead of through express.json.
+  app.post('/api/stripe/webhook', express.raw({ type: '*/*', limit: '1mb' }), (req, res) => {
+    if (!stripe.enabled) return fail(res, 503, 'billing_disabled', 'Billing is not set up');
+    let event;
+    try { event = verifyWebhook(req.body, req.get('stripe-signature'), config.stripeWebhookSecret); }
+    catch (e) { return fail(res, 400, 'bad_signature', 'Invalid signature'); }
+    try {
+      store.processStripeEvent(event.id, () => {
+        const obj = event.data && event.data.object;
+        if (!obj) return;
+        if (event.type === 'checkout.session.completed') {
+          const orgId = obj.client_reference_id || (obj.metadata && obj.metadata.org_id);
+          if (orgId && store.orgById(orgId)) store.linkOrgStripe(orgId, obj.customer, obj.subscription);
+        } else if (event.type.startsWith('customer.subscription.')) {
+          applySubscription(obj, event.created * 1000);
+        }
+      });
+      res.json({ received: true });
+    } catch (e) {
+      console.error('stripe webhook failed', e); // 500 makes Stripe retry later
+      res.status(500).json({ code: 'server_error', error: 'retry' });
+    }
+  });
 
   // ---------- email ----------
   // Tokens are random, single use and stored only as a hash. Links use the configured APP_URL (never the Host
@@ -250,6 +355,7 @@ export function createApp({ config, db, mailer = createMailer(config) }) {
       org: { id: req.org.id, name: req.org.name, plan: req.org.plan },
       aiEnabled: aiEnabled(req.org) && !needsVerify(req.user),
       email: { enabled: mailer.enabled, verified: req.user.emailVerified },
+      billing: billingSummary(req),
       limits: { maxImages: plan.maxImages },
       usage: usageSummary(req.org),
     });
