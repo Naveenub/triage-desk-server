@@ -11,10 +11,6 @@
 | [HOSTING PROVIDER] | Application hosting, database storage | All Customer Data | [REGION] | Yes |
 | [BACKUP DESTINATION, e.g. AWS S3 / other] | Off-site database backups | All Customer Data (including password hashes), in backup copies | [REGION] | Yes, if off-site backups are enabled |
 
-## Not subprocessors, but disclosed
-
-- **Google Fonts (Google LLC)** — the web app currently loads fonts from fonts.googleapis.com / fonts.gstatic.com, so the user's browser sends its IP address to Google. [Preferred fix: self-host the fonts and delete this row.]
-
 ## Changes
 
 | Date | Change |

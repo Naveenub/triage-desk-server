@@ -4,8 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Triage Desk – Smart support ticket AI</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;700&family=Public+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#eef1f4;--panel:#fff;--ink:#14212b;--mute:#5d6e7a;--line:#d5dce2;--accent:#0e7c86;--accent-ink:#fff;--p1:#c8321e;--p2:#d98200;--p3:#2b6cb0;--p4:#6b7c88;--soft:#e4eaee;
 box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
@@ -13,15 +11,15 @@ box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:en
 :root[data-theme="dark"]{--bg:#10181e;--panel:#18232b;--ink:#e6edf1;--mute:#93a4b0;--line:#2a3943;--accent:#3cc0cb;--accent-ink:#06242a;--p1:#ff6b55;--p2:#f0a63a;--p3:#6aa9ec;--p4:#8da0ad;--soft:#213039}
 *{box-sizing:border-box}
 html{scroll-padding-top:env(safe-area-inset-top,0px)}
-body{margin:0;background:var(--bg);color:var(--ink);font:400 15px/1.5 "Public Sans",system-ui,sans-serif}
-h1,h2,h3{font-family:"Bricolage Grotesque","Public Sans",sans-serif;margin:0;line-height:1.15}
+body{margin:0;background:var(--bg);color:var(--ink);font:400 15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+h1,h2,h3{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;margin:0;line-height:1.15}
 .wrap{max-width:1180px;margin:0 auto;padding:20px 16px 48px}
 header{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap;margin-bottom:18px}
 h1{font-size:30px;font-weight:700}
 .sub{color:var(--mute);max-width:56ch;margin:6px 0 0}
 .stats{display:flex;gap:8px;flex-wrap:wrap}
 .stat{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:6px 12px;min-width:64px}
-.stat b{display:block;font:700 20px "Bricolage Grotesque",sans-serif}
+.stat b{display:block;font:700 20px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 .stat span{font-size:12px;color:var(--mute)}
 .grid{display:grid;grid-template-columns:minmax(0,5fr) minmax(0,7fr);gap:16px}
 @media(max-width:860px){.grid{grid-template-columns:1fr}}
@@ -31,7 +29,7 @@ textarea{width:100%;min-height:130px;resize:vertical;border:1px solid var(--line
 input[type=text]{width:100%;border:1px solid var(--line);border-radius:6px;padding:8px 10px;background:var(--bg);color:var(--ink);font:inherit;margin-bottom:8px}
 :focus-visible{outline:3px solid var(--accent);outline-offset:2px}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
-button{font:600 14px "Public Sans",sans-serif;border:1px solid var(--line);background:var(--soft);color:var(--ink);border-radius:6px;padding:8px 14px;cursor:pointer}
+button{font:600 14px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;border:1px solid var(--line);background:var(--soft);color:var(--ink);border-radius:6px;padding:8px 14px;cursor:pointer}
 button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
 button.chip{font-weight:500;font-size:13px;padding:5px 10px}
 button:hover{filter:brightness(.96)}

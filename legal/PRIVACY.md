@@ -39,10 +39,10 @@ Our subprocessors may process data outside your country. [Describe safeguards: S
 
 ## 6. Retention
 
-- Customer Content and account data: kept while the workspace is active.
+- Customer Content and account data: kept while the workspace is active. Tickets older than [24] months and audit entries older than [24] months are deleted. [Set these; the server does not yet enforce them.]
 - On request, we erase a workspace's users, sessions, tickets, KB, known issues and audit log. 
 - AI usage records are kept with the workspace ID only, for billing records, after deletion. [Define period.]
-- Backups: deleted data can remain in backups until those backups are overwritten under our rotation ([N] snapshots, about [N] days). [Confirm figure; off-site copies follow the destination's retention.]
+- Backups: deleted data can remain in backups until those backups are overwritten under our rotation (14 snapshots, one every 24 hours, so about 14 days). [Confirm figure; off-site copies follow the destination's retention.]
 - Billing records: [period required by Indian/applicable tax law].
 - Expired sessions and one-time tokens are purged automatically.
 

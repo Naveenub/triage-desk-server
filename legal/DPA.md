@@ -33,7 +33,7 @@ Customer gives general authorization for the subprocessors at [URL to SUBPROCESS
 Where Provider transfers Personal Data to a country without an adequacy decision (or equivalent), the parties rely on [Standard Contractual Clauses / UK Addendum / other lawyer-selected mechanism], incorporated by reference with the module and annex details completed from this DPA. [Lawyer to complete.]
 
 ## 9. Return and deletion
-On termination, Customer may export its data for [30] days. After that Provider deletes Customer Data from live systems within [30] days, except where law requires retention. Copies in backups are overwritten under the rotation described in the Privacy Policy (up to [N] days). Provider keeps AI usage and billing records tied to the workspace ID only. Customer may request deletion of its workspace earlier in writing.
+On termination, Customer may export its data for [30] days. After that Provider deletes Customer Data from live systems within [30] days, except where law requires retention. Copies in backups are overwritten under the rotation described in the Privacy Policy (up to 14 days). Provider keeps AI usage and billing records tied to the workspace ID only. Customer may request deletion of its workspace earlier in writing.
 
 ## 10. Data subject requests
 Provider will promptly forward requests it receives about Customer Data and, taking into account the nature of processing, reasonably help Customer respond. Customer can edit and delete most Customer Data itself in the Service.
