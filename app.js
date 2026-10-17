@@ -8,8 +8,6 @@ import {
 import { callModel, extractJson, UpstreamError } from './anthropic.js';
 import { redact } from './redact.js';
 import { TIERS } from './config.js';
-import { createMailer, renderEmail } from './mailer.js';
-import { createStripe, verifyWebhook } from './stripe.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -17,24 +15,19 @@ const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{2,}$/;
 const IMG_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 const COOKIE = 'td_sid';
 
-export function createApp({ config, db, mailer = createMailer(config), stripe = createStripe(config) }) {
+export function createApp({ config, db }) {
   const store = makeStore(db);
   const app = express();
   app.disable('x-powered-by');
   if (config.trustProxy) app.set('trust proxy', 1);
 
   const loginLimiter = new Limiter(10, 15 * 60_000);   // failed logins per email+ip
-  const signupLimiter = new Limiter(config.signupsPerHourPerIp, 60 * 60_000);   // signups per ip
-  const forgotIpLimiter = new Limiter(config.resetRequestsPerHourPerIp, 60 * 60_000);    // reset requests per ip
-  const forgotEmailLimiter = new Limiter(3, 60 * 60_000);  // reset emails per address (extra requests are silently dropped)
-  const resetLimiter = new Limiter(20, 15 * 60_000);       // reset/verify token attempts per ip
-  const verifySendLimiter = new Limiter(3, 60 * 60_000);   // verification emails per user
+  const signupLimiter = new Limiter(5, 60 * 60_000);   // signups per ip
   const aiLimiter = new Limiter(60, 60_000);           // AI calls per org per minute (max comes from plan)
   const inflight = new Map();                          // orgId -> { n, tokens } reserved for running calls
   const streams = new Map();                           // orgId -> Set(res) for live updates
   const sweeper = setInterval(() => {
     loginLimiter.sweep(); signupLimiter.sweep(); aiLimiter.sweep(); store.purgeSessions();
-    forgotIpLimiter.sweep(); forgotEmailLimiter.sweep(); resetLimiter.sweep(); verifySendLimiter.sweep(); store.purgeEmailTokens(); store.purgeStripeEvents();
   }, 10 * 60_000);
   sweeper.unref();
 
@@ -49,8 +42,8 @@ export function createApp({ config, db, mailer = createMailer(config), stripe = 
       'Referrer-Policy': 'no-referrer',
       'X-Frame-Options': 'DENY',
       'Content-Security-Policy':
-        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; " +
-        "font-src 'self'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+        "font-src https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'",
     });
     next();
   });
@@ -100,7 +93,7 @@ export function createApp({ config, db, mailer = createMailer(config), stripe = 
       setCookie(res, token);
     }
     req.tokenHash = h;
-    req.user = { id: s.uid, email: s.email, name: s.uname, role: s.role, emailVerified: Boolean(s.email_verified_at) };
+    req.user = { id: s.uid, email: s.email, name: s.uname, role: s.role };
     req.org = { id: s.oid, name: s.oname, plan: s.plan, ai_tokens_override: s.ai_tokens_override, redact_server: s.redact_server };
     next();
   }
@@ -129,129 +122,6 @@ export function createApp({ config, db, mailer = createMailer(config), stripe = 
     };
   }
   const aiEnabled = (org) => Boolean(config.apiKey) && capOf(org) > 0;
-  // With email configured, AI spend needs a confirmed address. Without email configured, nothing is gated.
-  const needsVerify = (user) => mailer.enabled && !user.emailVerified;
-
-  // ---------- billing ----------
-  const ACTIVE = new Set(['active', 'trialing', 'past_due']);   // paid access continues (past_due: Stripe is still retrying the card)
-  const ENDED = new Set(['canceled', 'unpaid', 'incomplete_expired']);
-  function billingSummary(req) {
-    if (!stripe.enabled) return { enabled: false };
-    const o = store.orgById(req.org.id);
-    return {
-      enabled: true,
-      plans: Object.keys(config.stripePrices),
-      status: o.stripe_status || null,
-      subscribed: ACTIVE.has(o.stripe_status || ''),
-      canManage: Boolean(o.stripe_customer_id),
-      periodEnd: o.stripe_period_end || null,
-    };
-  }
-
-  // Admin starts a subscription. The org id travels with the Stripe objects as metadata, which is how the
-  // webhook finds the org again. The plan is NOT changed here: only a signed webhook from Stripe changes plans.
-  app.post('/api/billing/checkout', requireAuth, requireAdmin, small, async (req, res) => {
-    if (!stripe.enabled) return fail(res, 503, 'billing_disabled', 'Billing is not set up on this server');
-    const plan = (req.body || {}).plan;
-    if (typeof plan !== 'string' || !Object.hasOwn(config.stripePrices, plan)) return fail(res, 400, 'bad_request', 'Unknown plan');
-    const org = store.orgById(req.org.id);
-    if (ACTIVE.has(org.stripe_status || '')) return fail(res, 409, 'already_subscribed', 'This workspace already has a subscription. Use Manage billing to change it.');
-    try {
-      const session = await stripe.createCheckout({
-        mode: 'subscription',
-        line_items: [{ price: config.stripePrices[plan], quantity: 1 }],
-        client_reference_id: org.id,
-        ...(org.stripe_customer_id ? { customer: org.stripe_customer_id } : { customer_email: req.user.email }),
-        metadata: { org_id: org.id },
-        subscription_data: { metadata: { org_id: org.id } },
-        success_url: `${config.appUrl}/#billing=success`,
-        cancel_url: `${config.appUrl}/#billing=cancel`,
-      });
-      res.json({ url: session.url });
-    } catch (e) {
-      console.error(e.message);
-      fail(res, 502, 'upstream_error', 'Could not reach the payment provider. Try again.');
-    }
-  });
-
-  // Stripe-hosted page to change plan, update the card, see invoices or cancel.
-  app.post('/api/billing/portal', requireAuth, requireAdmin, async (req, res) => {
-    if (!stripe.enabled) return fail(res, 503, 'billing_disabled', 'Billing is not set up on this server');
-    const org = store.orgById(req.org.id);
-    if (!org.stripe_customer_id) return fail(res, 400, 'no_customer', 'This workspace has no billing account yet');
-    try {
-      const s = await stripe.createPortal({ customer: org.stripe_customer_id, return_url: `${config.appUrl}/` });
-      res.json({ url: s.url });
-    } catch (e) {
-      console.error(e.message);
-      fail(res, 502, 'upstream_error', 'Could not open the billing portal. Try again.');
-    }
-  });
-
-  function applySubscription(sub, eventAt) {
-    const org = (sub.metadata && sub.metadata.org_id && store.orgById(sub.metadata.org_id)) || store.orgByStripeCustomer(sub.customer);
-    if (!org) { console.error('stripe: subscription for unknown org', sub.id); return; }
-    if (org.stripe_event_at && eventAt < org.stripe_event_at) return; // an older event arriving late must not undo a newer one
-    const active = ACTIVE.has(sub.status), ended = ENDED.has(sub.status);
-    // The end of some OTHER (older) subscription must not cancel the one the org is on now.
-    if (ended && org.stripe_subscription_id && org.stripe_subscription_id !== sub.id) return;
-    const item = sub.items && sub.items.data && sub.items.data[0];
-    const periodEnd = (sub.current_period_end ?? (item && item.current_period_end) ?? null);
-    const base = { customerId: sub.customer, subscriptionId: sub.id, status: sub.status, periodEnd: periodEnd ? periodEnd * 1000 : null, eventAt };
-    if (active) {
-      const plan = stripe.priceToPlan[item && item.price && item.price.id];
-      if (!plan) { console.error('stripe: subscription', sub.id, 'has a price that is not in STRIPE_PRICES_JSON; plan left unchanged'); return; }
-      store.updateOrgBilling(org.id, { ...base, plan });
-      if (plan !== org.plan) store.addAudit(org.id, { by: 'stripe', act: 'plan_changed', d: `${org.plan} to ${plan}` });
-    } else if (ended) {
-      store.updateOrgBilling(org.id, { ...base, subscriptionId: null, plan: config.billingDowngradePlan });
-      store.addAudit(org.id, { by: 'stripe', act: 'plan_changed', d: `${org.plan} to ${config.billingDowngradePlan}` });
-    } else if (!org.stripe_subscription_id || org.stripe_subscription_id === sub.id) {
-      // e.g. incomplete: record the status only, and never let a not-yet-paid subscription hide a working one
-      store.updateOrgBilling(org.id, { ...base, subscriptionId: org.stripe_subscription_id, periodEnd: org.stripe_period_end });
-    }
-  }
-
-  // Needs the exact bytes Stripe signed, so it reads the body raw instead of through express.json.
-  app.post('/api/stripe/webhook', express.raw({ type: '*/*', limit: '1mb' }), (req, res) => {
-    if (!stripe.enabled) return fail(res, 503, 'billing_disabled', 'Billing is not set up');
-    let event;
-    try { event = verifyWebhook(req.body, req.get('stripe-signature'), config.stripeWebhookSecret); }
-    catch (e) { return fail(res, 400, 'bad_signature', 'Invalid signature'); }
-    try {
-      store.processStripeEvent(event.id, () => {
-        const obj = event.data && event.data.object;
-        if (!obj) return;
-        if (event.type === 'checkout.session.completed') {
-          const orgId = obj.client_reference_id || (obj.metadata && obj.metadata.org_id);
-          if (orgId && store.orgById(orgId)) store.linkOrgStripe(orgId, obj.customer, obj.subscription);
-        } else if (event.type.startsWith('customer.subscription.')) {
-          applySubscription(obj, event.created * 1000);
-        }
-      });
-      res.json({ received: true });
-    } catch (e) {
-      console.error('stripe webhook failed', e); // 500 makes Stripe retry later
-      res.status(500).json({ code: 'server_error', error: 'retry' });
-    }
-  });
-
-  // ---------- email ----------
-  // Tokens are random, single use and stored only as a hash. Links use the configured APP_URL (never the Host
-  // header, which an attacker controls) and put the token in the #fragment so it stays out of server logs.
-  function sendTokenEmail(user, purpose) {
-    const token = newToken();
-    const ttl = purpose === 'verify' ? config.verifyTokenHours * 3600_000 : config.resetTokenMinutes * 60_000;
-    store.createEmailToken({ hash: hashToken(token), userId: user.id, purpose, email: user.email, expiresAt: Date.now() + ttl });
-    const msg = renderEmail(purpose, { name: user.name, link: `${config.appUrl}/#${purpose === 'verify' ? 'verify' : 'reset'}=${token}` });
-    return sendMail(user.email, msg);
-  }
-  // Fire and forget: the HTTP response never waits on the provider, so timing cannot reveal whether an address exists.
-  function sendMail(to, msg) {
-    return Promise.resolve()
-      .then(() => mailer.send({ to, ...msg }))
-      .catch((e) => console.error('email send failed:', e.message));
-  }
 
   // ---------- auth routes ----------
   const validPassword = (p) => typeof p === 'string' && p.length >= 10 && p.length <= 200;
@@ -272,7 +142,6 @@ export function createApp({ config, db, mailer = createMailer(config), stripe = 
       pwHash: await hashPassword(b.password), plan: config.defaultPlan,
     });
     startSession(res, userId);
-    if (mailer.enabled) sendTokenEmail({ id: userId, email, name }, 'verify');
     res.status(201).json({ ok: true });
   });
 
@@ -292,56 +161,6 @@ export function createApp({ config, db, mailer = createMailer(config), stripe = 
     res.json({ ok: true });
   });
 
-  // ---------- password reset and email verification ----------
-  const isToken = (t) => typeof t === 'string' && /^[A-Za-z0-9_-]{20,100}$/.test(t);
-
-  // Always answers the same way, whether or not the address has an account.
-  app.post('/api/password/forgot', small, (req, res) => {
-    if (!mailer.enabled) return fail(res, 503, 'email_disabled', 'Password reset by email is not set up on this server. Ask your workspace admin.');
-    if (!forgotIpLimiter.take(req.ip)) return fail(res, 429, 'rate_limited', 'Too many requests. Try again later.');
-    const email = clean((req.body || {}).email, 255).toLowerCase();
-    if (EMAIL_RE.test(email) && forgotEmailLimiter.take(email)) {
-      const u = store.userByEmail(email);
-      if (u && !u.disabled) sendTokenEmail(u, 'reset');
-    }
-    res.json({ ok: true });
-  });
-
-  app.post('/api/password/reset', small, async (req, res) => {
-    if (!resetLimiter.take(req.ip)) return fail(res, 429, 'rate_limited', 'Too many attempts. Try again later.');
-    const b = req.body || {};
-    if (!isToken(b.token) || !store.emailTokenValid(hashToken(b.token), 'reset')) {
-      return fail(res, 400, 'bad_token', 'This reset link is invalid or has expired. Request a new one.');
-    }
-    if (!validPassword(b.password)) return fail(res, 400, 'weak_password', 'Use a password of at least 10 characters');
-    const pwHash = await hashPassword(b.password);
-    const u = store.useEmailToken(hashToken(b.token), 'reset', (user) => {
-      store.setPassword(user.id, pwHash);
-      store.markVerified(user.id); // they received mail at this address, which proves they own it
-      store.addAudit(user.org_id, { by: user.id, act: 'password_reset' });
-    });
-    if (!u) return fail(res, 400, 'bad_token', 'This reset link is invalid or has expired. Request a new one.');
-    sendMail(u.email, renderEmail('password_changed', { name: u.name }));
-    res.json({ ok: true });
-  });
-
-  // POST rather than GET, so mail scanners that pre-fetch links cannot use up the token.
-  app.post('/api/email/verify', small, (req, res) => {
-    if (!resetLimiter.take(req.ip)) return fail(res, 429, 'rate_limited', 'Too many attempts. Try again later.');
-    const b = req.body || {};
-    const u = isToken(b.token) && store.useEmailToken(hashToken(b.token), 'verify', (user) => store.markVerified(user.id));
-    if (!u) return fail(res, 400, 'bad_token', 'This confirmation link is invalid or has expired. Sign in and ask for a new one.');
-    res.json({ ok: true });
-  });
-
-  app.post('/api/email/send-verification', requireAuth, (req, res) => {
-    if (!mailer.enabled) return fail(res, 503, 'email_disabled', 'Email is not set up on this server');
-    if (req.user.emailVerified) return res.json({ ok: true, alreadyVerified: true });
-    if (!verifySendLimiter.take(req.user.id)) return fail(res, 429, 'rate_limited', 'Too many emails requested. Try again in an hour.');
-    sendTokenEmail(req.user, 'verify');
-    res.json({ ok: true });
-  });
-
   app.post('/api/logout', requireAuth, (req, res) => {
     store.deleteSession(req.tokenHash);
     clearCookie(res);
@@ -353,9 +172,7 @@ export function createApp({ config, db, mailer = createMailer(config), stripe = 
     res.json({
       user: req.user,
       org: { id: req.org.id, name: req.org.name, plan: req.org.plan },
-      aiEnabled: aiEnabled(req.org) && !needsVerify(req.user),
-      email: { enabled: mailer.enabled, verified: req.user.emailVerified },
-      billing: billingSummary(req),
+      aiEnabled: aiEnabled(req.org),
       limits: { maxImages: plan.maxImages },
       usage: usageSummary(req.org),
     });
@@ -376,7 +193,6 @@ export function createApp({ config, db, mailer = createMailer(config), stripe = 
     if (store.userByEmail(email)) return fail(res, 409, 'email_taken', 'That email already has an account');
     const id = newId('u_');
     store.createUser({ id, orgId: req.org.id, email, name, role, pwHash: await hashPassword(b.password) });
-    if (mailer.enabled) sendTokenEmail({ id, email, name }, 'verify');
     store.addAudit(req.org.id, { by: req.user.id, act: 'user_added', d: `${role}` });
     res.status(201).json({ id, email, name, role });
   });
@@ -512,7 +328,6 @@ export function createApp({ config, db, mailer = createMailer(config), stripe = 
     if (typeof b.prompt !== 'string' || !b.prompt.trim()) return fail(res, 400, 'bad_request', 'A prompt is required');
     if (b.prompt.length > config.maxPromptChars) return fail(res, 413, 'too_large', 'That ticket is too long to analyze');
     if (!config.apiKey) return fail(res, 503, 'not_granted', 'AI analysis is not configured on this server');
-    if (needsVerify(user)) return fail(res, 403, 'not_granted', 'Confirm your email address to use AI analysis. Check your inbox for the link.');
     const cap = capOf(org);
     if (cap <= 0) return fail(res, 403, 'not_granted', 'AI analysis is not included in your plan');
 

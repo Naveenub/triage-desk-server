@@ -1,7 +1,8 @@
 // A stand-in for api.anthropic.com so tests never spend real tokens.
 import http from 'node:http';
 
-export function startMock() {
+// override(promptText, isBulk) may return an object (or array, for bulk) to send back instead of the default.
+export function startMock({ override } = {}) {
   const requests = [];
   const server = http.createServer((req, res) => {
     let raw = '';
@@ -17,7 +18,8 @@ export function startMock() {
       };
       const bulk = text.includes('JSON array of tickets');
       const n = (text.match(/"ticket":/g) || []).length;
-      const out = bulk ? Array.from({ length: n }, (_, i) => ({ id: i, ...one })) : one;
+      const forced = override ? override(text, bulk, n) : null;
+      const out = forced || (bulk ? Array.from({ length: n }, (_, i) => ({ id: i, ...one })) : one);
       const reply = '```json\n' + JSON.stringify(out) + '\n```'; // fenced on purpose: the server must cope
       res.setHeader('content-type', 'application/json');
       res.end(JSON.stringify({

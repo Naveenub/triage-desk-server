@@ -182,9 +182,6 @@
     'dialog.td .err{color:var(--p1);font-size:14px;min-height:20px;margin-top:8px}',
     'dialog.td .acts{display:flex;gap:8px;justify-content:space-between;align-items:center;margin-top:12px;flex-wrap:wrap}',
     'dialog.td .link{background:none;border:0;padding:0;color:var(--accent);text-decoration:underline;font-weight:500}',
-    'dialog.td .ok{color:var(--accent);font-size:14px;min-height:20px;margin-top:8px}',
-    '#tdnote{background:var(--soft);border-bottom:1px solid var(--line);padding:6px 16px;font-size:13px;color:var(--ink)}',
-    '#tdbar .warn{color:var(--p2);font-weight:600}',
     'dialog.td table{width:100%;min-width:0;margin-top:8px}',
   ].join('');
   document.head.appendChild(css);
@@ -200,16 +197,14 @@
     return [el('label', { for: id, text: label }), input];
   }
 
-  function authDialog(initialNotice) {
+  function authDialog() {
     return new Promise((resolve) => {
       let mode = 'signin';
-      let notice = initialNotice || '';
       const dlg = el('dialog', { class: 'td', 'aria-labelledby': 'tda-h' });
       dlg.addEventListener('cancel', (e) => e.preventDefault()); // cannot be dismissed without signing in
       const form = el('form');
       const err = el('div', { class: 'err', role: 'alert' });
       const fields = el('div');
-      const forgot = el('button', { class: 'link', type: 'button', text: 'Forgot password?' });
       const title = el('h2', { id: 'tda-h' });
       const sub = el('p', { class: 'sub', style: 'margin:0 0 4px' });
       const submit = el('button', { class: 'primary', type: 'submit' });
@@ -222,133 +217,34 @@
           f.push(...field('tda-name', 'Your name', 'text', { autocomplete: 'name', maxlength: '80' }));
         }
         f.push(...field('tda-email', 'Work email', 'email', { autocomplete: 'email', maxlength: '255' }));
-        if (mode !== 'forgot') f.push(...field('tda-pw', mode === 'signup' ? 'Password (10 characters or more)' : 'Password', 'password',
+        f.push(...field('tda-pw', mode === 'signup' ? 'Password (10 characters or more)' : 'Password', 'password',
           { autocomplete: mode === 'signup' ? 'new-password' : 'current-password', minlength: mode === 'signup' ? '10' : '1', maxlength: '200' }));
         f.forEach((n) => fields.appendChild(n));
-        title.textContent = mode === 'signup' ? 'Create your workspace' : mode === 'forgot' ? 'Reset your password' : 'Sign in to Triage Desk';
-        sub.textContent = mode === 'signup' ? 'Your team shares one private queue, knowledge base and audit log.'
-          : mode === 'forgot' ? 'Enter your email and we will send you a link to choose a new password.'
-          : 'Your queue, knowledge base and audit log are private to your workspace.';
-        submit.textContent = mode === 'signup' ? 'Create workspace' : mode === 'forgot' ? 'Email me a link' : 'Sign in';
-        toggle.textContent = mode === 'signup' ? 'I already have an account' : mode === 'forgot' ? 'Back to sign in' : 'Create a workspace';
-        forgot.hidden = mode !== 'signin';
-        err.className = 'err'; err.textContent = notice; notice = '';
-        if (err.textContent) err.className = 'ok';
+        title.textContent = mode === 'signup' ? 'Create your workspace' : 'Sign in to Triage Desk';
+        sub.textContent = mode === 'signup' ? 'Your team shares one private queue, knowledge base and audit log.' : 'Your queue, knowledge base and audit log are private to your workspace.';
+        submit.textContent = mode === 'signup' ? 'Create workspace' : 'Sign in';
+        toggle.textContent = mode === 'signup' ? 'I already have an account' : 'Create a workspace';
+        err.textContent = '';
         const first = fields.querySelector('input');
         if (first) setTimeout(() => first.focus(), 0);
       }
-      toggle.onclick = () => { mode = mode === 'signin' ? 'signup' : 'signin'; draw(); };
-      forgot.onclick = () => { mode = 'forgot'; draw(); };
+      toggle.onclick = () => { mode = mode === 'signup' ? 'signin' : 'signup'; draw(); };
       form.onsubmit = async (e) => {
         e.preventDefault();
-        submit.disabled = true; err.className = 'err'; err.textContent = '';
+        submit.disabled = true; err.textContent = '';
         const v = (id) => (form.querySelector('#' + id) || {}).value || '';
         try {
-          if (mode === 'forgot') {
-            await api('/password/forgot', 'POST', { email: v('tda-email') });
-            err.className = 'ok'; err.textContent = 'If that address has an account, a reset link is on its way. It expires in one hour.';
-            submit.disabled = false; return;
-          }
           if (mode === 'signup') await api('/signup', 'POST', { orgName: v('tda-org'), name: v('tda-name'), email: v('tda-email'), password: v('tda-pw') });
           else await api('/login', 'POST', { email: v('tda-email'), password: v('tda-pw') });
           dlg.close(); dlg.remove(); resolve();
         } catch (x) { err.textContent = x.message; submit.disabled = false; }
       };
-      form.append(title, sub, fields, err, el('div', { class: 'acts' }, [toggle, forgot, submit]));
+      form.append(title, sub, fields, err, el('div', { class: 'acts' }, [toggle, submit]));
       dlg.appendChild(form);
       document.body.appendChild(dlg);
       draw();
       dlg.showModal();
     });
-  }
-
-  // Opened from the link in the reset email (#reset=TOKEN). Resolves once the password is changed.
-  function resetDialog(token) {
-    return new Promise((resolve) => {
-      const dlg = el('dialog', { class: 'td', 'aria-labelledby': 'tdr-h' });
-      dlg.addEventListener('cancel', (e) => e.preventDefault());
-      const form = el('form');
-      const err = el('div', { class: 'err', role: 'alert' });
-      const submit = el('button', { class: 'primary', type: 'submit', text: 'Change password' });
-      const back = el('button', { class: 'link', type: 'button', text: 'Back to sign in' });
-      back.onclick = () => { dlg.close(); dlg.remove(); resolve(false); };
-      form.onsubmit = async (e) => {
-        e.preventDefault();
-        const p1 = form.querySelector('#tdr-pw').value, p2 = form.querySelector('#tdr-pw2').value;
-        if (p1 !== p2) { err.textContent = 'The two passwords do not match'; return; }
-        submit.disabled = true; err.textContent = '';
-        try { await api('/password/reset', 'POST', { token, password: p1 }); dlg.close(); dlg.remove(); resolve(true); }
-        catch (x) { err.textContent = x.message; submit.disabled = false; }
-      };
-      const pw = { autocomplete: 'new-password', minlength: '10', maxlength: '200' };
-      form.append(el('h2', { id: 'tdr-h', text: 'Choose a new password' }),
-        ...field('tdr-pw', 'New password (10 characters or more)', 'password', pw),
-        ...field('tdr-pw2', 'Repeat the new password', 'password', pw),
-        err, el('div', { class: 'acts' }, [back, submit]));
-      dlg.appendChild(form);
-      document.body.appendChild(dlg);
-      dlg.showModal();
-      setTimeout(() => form.querySelector('#tdr-pw').focus(), 0);
-    });
-  }
-
-  // Links in emails carry a one-time token in the #fragment. Read it once and remove it from the address bar.
-  function takeHashToken() {
-    const m = /^#(reset|verify)=([A-Za-z0-9_-]{20,100})$/.exec(location.hash);
-    const bm = /^#billing=(success|cancel)$/.exec(location.hash);
-    if (m || bm) history.replaceState(null, '', location.pathname + location.search);
-    if (bm) return { kind: 'billing', token: bm[1] };
-    return m ? { kind: m[1], token: m[2] } : null;
-  }
-  // A link pasted into a tab that is already open only changes the hash: reload so boot sees it.
-  window.addEventListener('hashchange', () => { if (/^#(reset|verify)=|^#billing=/.test(location.hash)) location.reload(); });
-  // Billing dialog (admins). Checkout and the customer portal are Stripe-hosted pages: we only fetch a link and go there.
-  async function billingDialog() {
-    const b = me.billing;
-    const dlg = el('dialog', { class: 'td', 'aria-labelledby': 'tdb-h' });
-    const form = el('form', { method: 'dialog' });
-    const err = el('div', { class: 'err', role: 'alert' });
-    const go = async (path, body, btn) => {
-      err.textContent = ''; btn.disabled = true;
-      try { const r = await api(path, 'POST', body); location.href = r.url; }
-      catch (x) { err.textContent = x.message; btn.disabled = false; }
-    };
-    const statusLine = b.subscribed
-      ? 'Subscription active' + (b.status === 'past_due' ? ' (last payment failed: update your card)' : '') + (b.periodEnd ? '. Renews or ends ' + new Date(b.periodEnd).toLocaleDateString() : '') + '.'
-      : 'No active subscription.';
-    const kids = [el('h2', { id: 'tdb-h', text: 'Billing' }), el('p', { class: 'sub', text: 'Current plan: ' + me.org.plan + '. ' + statusLine })];
-    if (!b.subscribed) {
-      b.plans.forEach((p) => {
-        const btn = el('button', { class: 'primary', type: 'button', text: 'Subscribe to ' + p });
-        btn.onclick = () => go('/billing/checkout', { plan: p }, btn);
-        kids.push(el('div', { style: 'margin-top:10px' }, [btn]));
-      });
-    }
-    if (b.canManage) {
-      const btn = el('button', { class: 'chip', type: 'button', text: 'Manage billing (card, invoices, cancel)' });
-      btn.onclick = () => go('/billing/portal', undefined, btn);
-      kids.push(el('div', { style: 'margin-top:10px' }, [btn]));
-    }
-    kids.push(err, el('div', { class: 'acts' }, [el('button', { type: 'submit', formnovalidate: '', text: 'Close' })]));
-    form.append(...kids);
-    dlg.appendChild(form);
-    dlg.addEventListener('close', () => dlg.remove());
-    document.body.appendChild(dlg);
-    dlg.showModal();
-  }
-
-  // After paying, the plan changes when Stripe's webhook arrives (usually seconds). Check a few times, then reload.
-  function waitForPlanChange(startPlan, tries) {
-    api('/me').then((m) => {
-      if (m.org.plan !== startPlan) { location.reload(); return; }
-      if (tries > 0) setTimeout(() => waitForPlanChange(startPlan, tries - 1), 2500);
-      else showNote('Payment received. Your plan will update shortly: reload this page in a minute.');
-    }).catch(() => {});
-  }
-  function showNote(text) {
-    const n = el('div', { id: 'tdnote', role: 'status', text });
-    document.body.insertBefore(n, document.body.firstChild);
-    setTimeout(() => n.remove(), 12000);
   }
 
   let bar;
@@ -360,16 +256,7 @@
     const left = el('div', { class: 'grp' }, [el('b', { text: me.org.name }), document.createTextNode(me.user.name + ' (' + me.user.role + ')')]);
     const u = me.usage;
     const ai = el('div', { class: 'grp' });
-    if (me.email && me.email.enabled && !me.email.verified) {
-      ai.appendChild(el('span', { class: 'warn', text: 'Confirm your email (' + me.user.email + ') to turn on AI analysis.' }));
-      const rs = el('button', { class: 'chip', type: 'button', text: 'Resend link' });
-      rs.onclick = async () => {
-        rs.disabled = true;
-        try { await api('/email/send-verification', 'POST', {}); rs.textContent = 'Sent. Check your inbox'; }
-        catch (x) { rs.textContent = x.message; }
-      };
-      ai.appendChild(rs);
-    } else if (!me.aiEnabled) {
+    if (!me.aiEnabled) {
       ai.appendChild(document.createTextNode(u && u.cap <= 0 ? 'Plan: ' + u.plan + ' (keyword rules only, AI analysis not included)' : 'AI analysis is not available on this server'));
     } else {
       const pct = Math.min(100, Math.round((100 * u.used) / u.cap));
@@ -378,7 +265,6 @@
       if (pct >= 100) ai.appendChild(el('b', { text: 'Limit reached: keyword rules still work' }));
     }
     const right = el('div', { class: 'grp' });
-    if (me.user.role === 'admin' && me.billing && me.billing.enabled) { const bb = el('button', { class: 'chip', type: 'button', text: 'Billing' }); bb.onclick = billingDialog; right.appendChild(bb); }
     if (me.user.role === 'admin') { const b = el('button', { class: 'chip', type: 'button', text: 'Team' }); b.onclick = teamDialog; right.appendChild(b); }
     const out = el('button', { class: 'chip', type: 'button', text: 'Sign out' });
     out.onclick = async () => { try { await api('/logout', 'POST', {}); } catch (e) { /* ignore */ } location.reload(); };
@@ -428,35 +314,15 @@
   }
 
   async function boot() {
-    const link = takeHashToken();
-    let note = '';
-    if (link && link.kind === 'reset') {
-      await new Promise((r) => (document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', r) : r()));
-      if (await resetDialog(link.token)) note = 'Password changed. Sign in with your new password.';
-    } else if (link && link.kind === 'verify') {
-      try { await api('/email/verify', 'POST', { token: link.token }); note = 'Email confirmed. Thank you.'; }
-      catch (x) { note = x.message; }
-    }
     try { me = await api('/me'); }
     catch (e) {
       if (e.code === 'network') { document.addEventListener('DOMContentLoaded', () => { document.body.insertBefore(el('div', { id: 'tdbar', text: 'Cannot reach the server. Reload to try again.' }), document.body.firstChild); }); return; }
       await new Promise((r) => (document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', r) : r()));
-      await authDialog(link && link.kind === 'reset' ? note : '');
+      await authDialog();
       me = await api('/me');
-      if (link && link.kind === 'reset') note = '';
     }
     await new Promise((r) => (document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', r) : r()));
     drawBar();
-    if (note) showNote(note);
-    if (link && link.kind === 'billing') {
-      if (link.token === 'success') { showNote('Payment received. Updating your plan…'); waitForPlanChange(me.org.plan, 8); }
-      else showNote('Checkout cancelled. You were not charged.');
-    }
-    // Confirmed the address in another tab? Pick that up when this tab is shown again.
-    document.addEventListener('visibilitychange', () => {
-      if (document.hidden || !(me.email && me.email.enabled && !me.email.verified)) return;
-      api('/me').then((m) => { if (m.email && m.email.verified) location.reload(); }).catch(() => {});
-    });
     startEvents();
     setInterval(() => { if (!document.hidden) api('/usage').then((u) => { me.usage = u; drawBar(); }).catch(() => {}); }, 60000);
     readyResolve();

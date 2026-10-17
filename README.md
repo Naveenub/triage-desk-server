@@ -19,65 +19,11 @@ Needs Node 22.13 or newer (uses the built-in `node:sqlite`, so there is nothing 
 | Concern | How |
 |---|---|
 | Sign-in | Email and password (scrypt), HttpOnly SameSite=Lax session cookie, login throttling, sign-up throttling, origin check on every write |
-| Password reset and email verification | One-time links by email (see below). A reset signs the account out everywhere. With email on, AI analysis needs a confirmed address |
 | Tenancy | Every ticket, KB article, known issue, correction and audit row carries the org id, and every query filters on the org of the signed-in user. Tested: one org cannot read, overwrite or delete another's data |
 | Roles | `admin` (manages team), `agent` (edits, can use AI), `viewer` (read-only, cannot spend AI budget) |
 | Audit log | Append-only, enforced by database triggers. `who` and `when` are stamped by the server, not the client |
 | `/api/analyze` | Authenticates the org, clamps the model tier to the plan, applies redaction server-side, enforces the monthly token cap, per-minute rate limit and concurrency limit, records tokens per call |
 | Live team updates | Server-sent events, with polling as a fallback |
-
-## Email: password reset and verification
-
-Set four variables and restart. Resend is the one tested against; Postmark is wired the same way.
-
-```bash
-EMAIL_PROVIDER=resend
-RESEND_API_KEY=re_...
-EMAIL_FROM="Triage Desk <no-reply@yourdomain.com>"   # the domain must be verified in the Resend dashboard
-APP_URL=https://desk.yourdomain.com                   # links in emails are built from this
-```
-
-How it behaves:
-
-- **Verification.** Sign-up and "add teammate" send a confirmation link (24 hours, one use). Until it is used, the top bar shows a reminder with a resend button and AI analysis is refused; keyword rules keep working. Existing users count as unconfirmed after you turn email on and will see the same reminder.
-- **Reset.** "Forgot password?" on the sign-in dialog emails a link (1 hour, one use). Using it sets the new password, ends every session for that account, confirms the address and writes `password_reset` to the org audit log. A "your password was changed" email follows.
-- **Without a provider** (`EMAIL_PROVIDER` unset) nothing changes: no gating, and "Forgot password?" tells the user to ask their admin. `EMAIL_PROVIDER=log` prints emails to the console for local testing.
-- **Safety properties.** The forgot-password answer is identical for unknown and known addresses and does not wait for the provider. Tokens are 256-bit, stored only as SHA-256, and a newer link replaces an older one. Links use `APP_URL`, never the Host header, and carry the token in the `#fragment` so it stays out of server logs. Confirmation happens by POST, so mail scanners that pre-fetch links cannot use the token up. Limits: 3 reset emails per address per hour, 10 requests per IP per hour, 3 verification emails per user per hour.
-- **Other senders.** SES and SMTP are not included. A provider is one function in `mailer.js` returning `send({to, subject, text, html})`.
-
-## Backups (SQLite)
-
-Everything lives in one file (`DB_PATH`), so a backup is a consistent copy of it. `VACUUM INTO` takes that copy while the server is running, without stopping writes, and each snapshot is opened and integrity-checked before it counts. Do not just `cp` the `.db` file of a running server: in WAL mode that can miss recent writes.
-
-```bash
-node scripts/backup.js                 # writes ./backups/triage-YYYYMMDD-HHMMSS.db, keeps the newest 14
-node scripts/backup.js /mnt/backups 30 # custom folder and number to keep
-```
-
-Run it on a schedule, either from cron (`0 */6 * * * cd /app && node --env-file=.env scripts/backup.js`) or inside the server with `BACKUP_EVERY_HOURS=24`. Backups hold password hashes and customer data, so files are created `0600` in a `0700` folder.
-
-**A backup on the same disk does not survive losing the disk.** Copy the folder somewhere else on a schedule, for example `aws s3 sync /app/backups s3://your-bucket/triage/` or `rclone sync /app/backups remote:triage`, and turn on versioning or retention at the destination.
-
-Restore: stop the server, copy the chosen snapshot over `DB_PATH` (and delete any `DB_PATH-wal` and `DB_PATH-shm` files next to it), start the server. Try a restore once on a spare machine before you need it. Anything written after the snapshot is lost, which is why the interval matters: `BACKUP_EVERY_HOURS=6` means at most six hours.
-
-## Billing (Stripe)
-
-Stripe Checkout for sign-up, a webhook that sets the plan, and the Stripe customer portal for card changes, invoices and cancellation. Prices live in Stripe, so changing a price never needs a deploy.
-
-Setup, in the Stripe dashboard:
-1. Create a recurring **Price** for each paid plan and copy its `price_...` id.
-2. Turn on the **Customer portal** (Settings, Billing, Customer portal) and choose what customers may do there.
-3. Add a **webhook endpoint** `https://YOUR-APP-URL/api/stripe/webhook` with the events `checkout.session.completed` and `customer.subscription.created`, `.updated`, `.deleted`. Copy its signing secret.
-4. Set `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_TEAM` (or `STRIPE_PRICES_JSON` for several plans) and `APP_URL`. The server refuses to start if only some are set, or if a price names a plan that is not in `config.js`.
-5. Test with `sk_test_` keys and Stripe's test cards before going live; `stripe listen --forward-to localhost:3000/api/stripe/webhook` forwards events to your machine.
-
-How it behaves:
-- An admin sees a **Billing** button. It starts Checkout for a plan, or opens the portal once the workspace has a Stripe customer. Checkout and the portal are Stripe's pages.
-- **Only a signed webhook changes the plan.** Returning from Checkout does not, so nobody can reach a paid plan by visiting the success URL. The page re-checks for a few seconds after payment and then reloads.
-- `active`, `trialing` and `past_due` keep the paid plan (while Stripe retries a failed card the customer keeps access and sees a notice). `canceled`, `unpaid` and `incomplete_expired` move the org to `BILLING_DOWNGRADE_PLAN` (default `free`: keyword rules only; their data stays).
-- Webhooks are verified (HMAC, 5-minute tolerance), processed once per event id in the same transaction as the change, and a failure returns 500 so Stripe retries. An older event arriving after a newer one is ignored, and so is the end of a previous subscription.
-- Plan changes are written to the org audit log as `plan_changed`. A workspace that already has a subscription cannot open a second Checkout.
-- A plan set by hand with `set-plan.js` is overwritten by the next Stripe event for that org. Use it only for orgs that do not pay through Stripe. Per-org token overrides are left alone.
 
 ## Cost control (this is now yours)
 
@@ -98,20 +44,27 @@ node scripts/delete-org.js <org-id> --yes                # erase a customer's co
 ## Tests
 
 ```bash
-npm test                                   # 43 tests against a mock AI (no real tokens spent)
+npm test                                   # 15 API tests against a mock AI (no real tokens spent)
 python3 test/e2e/e2e.py                    # real-browser run (needs Playwright; start test/e2e/server.mjs first)
+python3 test/e2e/xss.py                    # hostile-input browser tests (start test/e2e/xss-server.mjs first, port 3457)
 ```
 
 ## Not built yet
 
 These matter before you take money or real customer data:
 
-1. **Tax, invoices and refunds policy.** Stripe billing is built (next section) but VAT/GST collection (Stripe Tax), invoice branding and your refund and cancellation terms are yours to set up in the Stripe dashboard.
-2. **SSO.** Not built. (Email verification and password reset are built: see the next section.)
+1. **Billing.** No Stripe. Plans are changed with `set-plan.js` for now. The natural next step is a Stripe Checkout link plus a webhook that sets `orgs.plan`.
+2. **Email verification, password reset, SSO.** Sign-up accepts any email address, and a forgotten password currently needs you to reset it by hand. Set `SIGNUP_ENABLED=false` for invite-only until this exists.
 3. **Scaling past one process.** The rate limiters and the live-update streams are in memory, and the database is a single SQLite file. For several instances, move to Postgres (all SQL is in `db.js`) and Redis.
-4. **Retention and off-site copies.** Backups exist (next section) but there is no retention policy for tickets or the audit log, and nothing copies backups off the machine for you.
+4. **Backups and retention.** Back up `DB_PATH`. There is no automatic retention policy for tickets or the audit log.
 5. **Legal and compliance.** A DPA, subprocessor list and privacy policy. Redaction masks emails, phones, card and ID numbers, keys, passwords and IPs, but not names or free-text details, and it cannot mask text inside screenshots.
-6. **A security review of the page itself.** The page builds a lot of HTML from ticket text. It escapes it, but with multiple customers' data on one server it deserves a dedicated XSS pass.
+6. **Page security review: done** (see below). Still open: validate ticket documents server-side too, so other clients get the same guarantees.
+
+## Page XSS hardening
+
+- Stored documents and model output are coerced by `normTicket`/`normKB`/`normKN`/`normAud`/`normCorr` before rendering; enums (`pr`, `mood`, `status`, `source`, categories) are checked against known values.
+- Every dynamic value in a template goes through `esc()`, which now also escapes `'`.
+- CSP is `script-src 'self'` (the page script moved to `public/triage.js`), plus `object-src 'none'` and `form-action 'self'`, so a missed escape no longer runs.
 
 ## Changes made to the page
 
